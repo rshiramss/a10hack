@@ -33,7 +33,11 @@ def flag_outcome(
 def flag_agent_outcomes(
     conn: sqlite3.Connection, now: float, agent_id: str, reason: str, actor: str
 ) -> int:
-    """Flag every outcome row the agent ever wrote. Returns how many new flags were added."""
+    """Flag every outcome row the agent ever wrote. Returns how many new flags were added.
+
+    DECISION: "every outcome the agent ever submitted" is read as every outcome row it wrote,
+    drafts and superseded rows included, which is the more restrictive reading.
+    """
     rows = conn.execute("SELECT outcome_id FROM outcomes WHERE agent_id = ?", (agent_id,))
     return sum(flag_outcome(conn, now, row["outcome_id"], reason, actor) for row in rows.fetchall())
 
@@ -113,7 +117,8 @@ def suspend_agent(
 ) -> None:
     """Suspend pending human review: badge stops working, plans end, tasks stay assigned.
 
-    Reassignment after a suspension is the orchestrator's call, not automatic.
+    DECISION: unlike revocation, suspension doesn't flag outcomes or return tasks. A human
+    reviews first; reassignment after a suspension is the orchestrator's call (section 7).
     """
     now = runtime.clock.now()
     agent = conn.execute(

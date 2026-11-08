@@ -68,7 +68,11 @@ def count_arm_terms(config: TrialConfig, text: str) -> int:
 
 
 def check_input_content(ctx: CallContext) -> Decision:
-    """Pipeline step 10: canaries anywhere revoke; injections deny; arm terms get flagged."""
+    """Pipeline step 10: canaries anywhere revoke; injections deny; arm terms get flagged.
+
+    DECISION: the spec requires canary scanning of blinded agents' input; this scans every
+    role's input. No legitimate input contains a canary, so the stricter rule costs nothing.
+    """
     if contains_canary(ctx.config, ctx.args):
         return Deny(reasons.DENY_CANARY, Action.REVOKE, detail="canary token in input")
     arm_term_hits = 0

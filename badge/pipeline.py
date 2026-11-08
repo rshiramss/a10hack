@@ -60,6 +60,9 @@ PLANNED_CHECKS: tuple[Check, ...] = (
     scanners.check_input_content,
 )
 
+# DECISION: monitor tools are used by humans clicking a dashboard, so they are not planned
+# (no declare_plan / per-step leases). They still pass badge, role, schema, budget, scanner,
+# and audit checks, and break-the-glass keeps its own single-use lease.
 UNPLANNED_CHECKS: tuple[Check, ...] = (
     idempotency.check_replay,
     leases.check_standing_lease,

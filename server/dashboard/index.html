@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Badge Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,800&family=JetBrains+Mono:wght@400;600;800&display=swap">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="brand">
+      <h1>Badge</h1>
+      <p class="tagline">Chinese walls for AI agents &middot; <span id="trial-id">&hellip;</span></p>
+    </div>
+    <div class="masthead-right">
+      <div class="totals" aria-label="Decision totals">
+        <span class="total allow"><b id="total-allow">0</b> allowed</span>
+        <span class="total deny"><b id="total-deny">0</b> denied</span>
+      </div>
+      <div id="chain-seal" class="seal" role="status">chain &hellip;</div>
+      <div class="session">
+        <span id="monitor-name"></span>
+        <button id="logout" class="link-button" type="button" hidden>switch monitor</button>
+      </div>
+    </div>
+  </header>
+
+  <div id="unblind-banner" class="banner" role="alert" hidden></div>
+
+  <section id="login" class="login" aria-labelledby="login-heading" hidden>
+    <form id="login-form" class="login-card">
+      <h2 id="login-heading">Monitor sign-in</h2>
+      <p class="muted">Demo-grade login. Two different monitors are needed to approve an emergency unblind.</p>
+      <label>Username <input name="username" autocomplete="username" required maxlength="32"></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required maxlength="128"></label>
+      <button type="submit" class="primary">Sign in</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </section>
+
+  <main id="console" class="console" hidden>
+    <section class="panel agents" aria-labelledby="agents-heading">
+      <h2 id="agents-heading">Agents</h2>
+      <div id="agents" class="agent-list"></div>
+    </section>
+
+    <section class="panel feed" aria-labelledby="feed-heading">
+      <div class="panel-head">
+        <h2 id="feed-heading">Live audit feed</h2>
+        <button id="clear-filter" class="chip-button" type="button" hidden></button>
+      </div>
+      <ol id="audit" class="audit-feed" reversed></ol>
+    </section>
+
+    <section class="panel side" aria-labelledby="leases-heading">
+      <h2 id="leases-heading">Leases</h2>
+      <ul id="leases" class="lease-list"></ul>
+      <h2 class="spaced">Handoffs <span class="muted small">typed values only</span></h2>
+      <ul id="handoffs" class="handoff-list"></ul>
+    </section>
+
+    <section class="panel outcomes" aria-labelledby="outcomes-heading">
+      <h2 id="outcomes-heading">Outcomes</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Visit</th><th>Slot</th><th>Measure</th><th>Score</th><th>Agent</th><th>Flags</th></tr></thead>
+          <tbody id="outcomes"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel escalations" aria-labelledby="esc-heading">
+      <h2 id="esc-heading">Escalation queue</h2>
+      <ul id="escalations" class="escalation-list"></ul>
+      <h2 class="spaced">Alerts</h2>
+      <ul id="alerts" class="alert-list"></ul>
+    </section>
+
+    <section class="panel controls" aria-labelledby="controls-heading">
+      <h2 id="controls-heading">Break the glass</h2>
+      <form id="unblind-form" class="unblind-form">
+        <label>Patient <input name="patient_id" placeholder="P004" pattern="P[0-9]{3}" required maxlength="4"></label>
+        <label>Safety reason <input name="reason" required maxlength="300" placeholder="Serious adverse event"></label>
+        <button type="submit" class="danger">Request emergency unblind</button>
+      </form>
+      <ul id="unblind-requests" class="request-list"></ul>
+      <p id="reveal" class="reveal" hidden></p>
+      <p id="action-status" class="status-line" role="status"></p>
+    </section>
+  </main>
+</body>
+</html>

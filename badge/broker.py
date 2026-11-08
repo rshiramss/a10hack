@@ -172,6 +172,9 @@ def read(
     if row is None:
         return ReadResult(None, f"{channel_id} not yet available")
     if row["revoked"] is not None:
+        # DECISION: a revoked agent's earlier handoffs stop flowing. Its outcomes are flagged
+        # and excluded from analysis, so the adjudicator must not compare against them either;
+        # the visit stays blocked for human follow-up.
         return ReadResult(None, f"{channel_id} came from a revoked badge")
     try:
         value = json.loads(row["value_json"])

@@ -124,7 +124,12 @@ def approve_emergency_unblind(ctx: ToolContext) -> dict[str, Any]:
 
 
 def view_emergency_unblind(ctx: ToolContext) -> dict[str, Any]:
-    """Returns the arm to the approving monitor only. The pipeline consumes the lease."""
+    """Returns the arm to the approving monitor only. The pipeline consumes the lease.
+
+    DECISION: section 9.5 says approval issues a single-use lease and the assignment goes to
+    the monitor, but names no tool to spend the lease. This tool is that step, so approval
+    and disclosure stay separate, auditable events.
+    """
     request_id = ctx.args["request_id"]
     row = ctx.conn.execute(
         "SELECT u.patient_id, a.arm FROM unblind_requests u"

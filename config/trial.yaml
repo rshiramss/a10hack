@@ -28,7 +28,8 @@ roles:
     tools: [open_patient_visit, record_outcome, submit]
     budgets:
       max_steps_per_plan: 8
-      max_calls_per_minute: 20
+      # One read is ~7 calls; this leaves room for a few reads a minute, no more.
+      max_calls_per_minute: 40
       max_reads_per_task: 1
       max_denied_calls_per_badge: 3
       max_replans_per_task: 1
