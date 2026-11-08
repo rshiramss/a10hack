@@ -49,7 +49,7 @@
           <span class="muted small">Agents never talk to each other. Every arrow goes through the gateway.</span>
         </div>
         <div id="master-row" class="master-row"></div>
-        <div class="gateway-bar"><span>GATEWAY</span><small>policy check · lease · delegation · sealed consult · handshake · typed output</small></div>
+        <div class="gateway-bar"><span>GATEWAY</span><small>attested code · key-bound badge · signed call · lease · delegation · sealed consult · handshake · typed output</small></div>
         <div id="lanes" class="lanes"></div>
       </section>
 
@@ -102,7 +102,9 @@
         <label>Step pace <input id="step-delay" type="range" min="0" max="3000" step="100"> <span id="step-delay-text"></span></label>
         <label class="toggle"><input id="replace" type="checkbox"> replace a revoked specialist once</label>
         <div class="control-buttons">
-          <button id="rogue" type="button">Rogue agent test</button>
+          <button id="rogue" type="button" title="A specialist tries to call another specialist, through and around the gateway.">Rogue agent</button>
+          <button id="steal" type="button" title="An attacker exfiltrates the master's badge and one signed request, then tries to use them.">Steal master's badge</button>
+          <button id="tampered" type="button" title="Spawn an agent whose code was modified to hide allergies.">Tampered agent</button>
           <button id="reset" type="button" class="danger-outline">Reset</button>
         </div>
       </details>

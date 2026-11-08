@@ -16,6 +16,18 @@ each owning its own tools and records. Nothing about any request is scripted: th
 file `config/hospital.yaml` defines roles, tools, typed inputs/outputs, and limits; the
 model decides the plan at run time.
 
+Every agent, master included, proves its identity in three ways before it can act:
+
+- **Attested code.** At spawn, an instance presents a SHA-256 measurement of the exact code
+  it will run plus its role's policy. The gateway compares it to the registered build; a
+  mismatch gets no badge and the instance is quarantined. (Demo note: the measurement is
+  self-reported in-process; in production it would come from a TEE or SPIFFE attestor.)
+- **Key-bound badge.** The agent generates its own Ed25519 key and proves it holds it at
+  login. The badge is bound to that key (`cnf.jkt`), so a stolen badge alone is useless.
+- **Signed calls.** Every call carries a fresh proof signed with that key: which operation,
+  a hash of the badge, a timestamp, and a one-time id. Replays and foreign keys are refused,
+  and a badge used without its key is revoked as stolen.
+
 Every consult is a two-way handshake through the gateway. Agents never exchange
 natural language, only schema-checked typed values:
 
@@ -33,11 +45,17 @@ natural language, only schema-checked typed values:
    typed result back. The gateway validates it against the output schema (a poisoned record
    is quarantined, never forwarded) and pipes typed values to later steps.
 
-Demo controls: **Revoke** any agent at any moment (a revoked specialist is replaced by a
+Demo controls: **Steal master's badge** (an attacker replays a captured request, signs
+with its own key, then tries the bare badge: all refused, badge revoked), **Tampered agent**
+(a MedHistoryAgent modified to hide allergies is refused a badge), **Revoke** any agent at any moment (a revoked specialist is replaced by a
 fresh instance once; a revoked master aborts its run), **stuck-agent mode** (the watchdog
 revokes a master that makes no progress for N seconds), **Rogue agent test** (a specialist
 tries to call another one, through and around the gateway), and **Reset**. Every decision
 lands in a hash-chained, append-only audit log, shown as the security log.
+
+**Live end-to-end test with the real model:** `uv run python -m scripts.e2e_live` runs every
+demo scenario against your local model and writes `e2e_report.md` (security checks that
+must always pass, plus model-quality checks) and `e2e_transcripts.json`.
 
 Switch models with `BADGE_LLM_PROVIDER=openai BADGE_LLM_BASE_URL=... BADGE_LLM_API_KEY=...
 BADGE_MODEL=...` (Groq works). Synthetic data only; not medical advice.

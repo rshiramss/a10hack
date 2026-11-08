@@ -255,6 +255,27 @@ def create_app(
             return bad
         return JSONResponse({"ok": True, "results": app.state.console.gateway.rogue_test()})
 
+    @app.post("/api/attack/steal")
+    def steal(request: Request) -> JSONResponse:
+        """Exfiltrate the master's badge plus one signed request it already sent, and try
+        to use them."""
+        if (bad := guarded(request)) is not None:
+            return bad
+        c = app.state.console
+        c.master.ensure_identity()
+        captured = c.master._cred("capabilities")  # noqa: SLF001 - simulated exfiltration
+        c.gateway.capabilities(captured)  # the real master's request, sent once
+        stolen = c.master._token  # noqa: SLF001
+        return JSONResponse({"ok": True, "results": c.gateway.steal_badge_test(stolen, captured)})
+
+    @app.post("/api/attack/tampered")
+    def tampered(request: Request) -> JSONResponse:
+        if (bad := guarded(request)) is not None:
+            return bad
+        return JSONResponse(
+            {"ok": True, "results": app.state.console.gateway.tampered_agent_test()}
+        )
+
     @app.post("/api/reset")
     def reset(request: Request) -> JSONResponse:
         if (bad := guarded(request)) is not None:

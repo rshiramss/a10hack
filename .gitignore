@@ -7,3 +7,7 @@ __pycache__/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+
+# live e2e output
+e2e_report.md
+e2e_transcripts.json

@@ -15,7 +15,9 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from ward.gateway import Denied, Gateway
+from ward import crypto
+from ward.attestation import master_functions, measure
+from ward.gateway import Credential, Denied, Gateway
 
 PLAN_TOOL = {
     "type": "function",
@@ -180,23 +182,41 @@ class MasterAgent:
         self.agent_id: str | None = None
         self._secret: str | None = None
         self._token: str | None = None
+        self._key: crypto.AgentKey | None = None
         self.lock = threading.Lock()
 
     # ---- identity ---------------------------------------------------------------------
 
+    def _cred(self, op: str) -> Credential:
+        """Badge + a fresh proof, signed with this agent's own key, for one operation."""
+        assert self._token is not None and self._key is not None
+        return Credential(self._token, self._key.proof(self._token, op))
+
+    def _login(self) -> None:
+        cfg = self.gw.config
+        session = self.gw.authenticate(
+            self.agent_id,
+            self._secret,
+            self._key.public_pem,
+            self._key.proof(self._secret, "authenticate"),
+            measure(cfg.master_role, cfg, master_functions()),
+        )
+        self._token = session["token"]
+
     def ensure_identity(self) -> str:
         """Authenticate, re-authenticating on expiry. A revoked master is never revived:
-        a new instance (OrchestratorAgent2, ...) gets its own credentials."""
+        a new instance (OrchestratorAgent2, ...) gets its own credentials and key."""
         if self._token:
             try:
                 self.gw.check_badge(self._token)
                 return self._token
             except Denied as exc:
                 if exc.reason == "DENY_BADGE_EXPIRED":
-                    self._token = self.gw.authenticate(self.agent_id, self._secret)["token"]
+                    self._login()
                     return self._token
         self.agent_id, self._secret = self.gw.provision(self.gw.config.master_role)
-        self._token = self.gw.authenticate(self.agent_id, self._secret)["token"]
+        self._key = crypto.AgentKey()
+        self._login()
         return self._token
 
     # ---- one chat request ---------------------------------------------------------------
@@ -204,7 +224,7 @@ class MasterAgent:
     def handle(self, prompt: str, fault: str | None = None) -> str:
         """Run one request end to end. Returns the run id. Blocks until done."""
         token = self.ensure_identity()
-        run_id = self.gw.start_run(token, prompt)
+        run_id = self.gw.start_run(self._cred("start_run"), prompt)
         try:
             self._handle(token, run_id, prompt, fault)
         except Denied as exc:
@@ -225,7 +245,7 @@ class MasterAgent:
         return self.llm.chat.completions.create(**kwargs).choices[0].message
 
     def _handle(self, token: str, run_id: str, prompt: str, fault: str | None) -> None:
-        caps = self.gw.capabilities(token)
+        caps = self.gw.capabilities(self._cred("capabilities"))
         max_plans = int(self.gw.config.run["max_plans_per_run"])
         system = PLANNER_PROMPT.format(
             capabilities=_capabilities_text(caps),
@@ -245,7 +265,9 @@ class MasterAgent:
             message = self._chat(messages, tools)
             must_replan = False
             kind, payload = _extract_steps(message)
-            self.gw.report_progress(token, run_id, "planned" if kind == "plan" else "replied")
+            self.gw.report_progress(
+                self._cred("report_progress"), run_id, "planned" if kind == "plan" else "replied"
+            )
             if kind != "plan":
                 if results:
                     break  # enough evidence; write the answer below
@@ -253,12 +275,12 @@ class MasterAgent:
                     "The model returned neither a plan nor an explanation. Try naming the "
                     "patient (by name or id like P003) and what you want checked."
                 )
-                self.gw.finish_run(token, run_id, answer)
+                self.gw.finish_run(self._cred("finish_run"), run_id, answer)
                 return
             plans_used += 1
             messages.append({"role": "assistant", "content": json.dumps({"steps": payload})})
             try:
-                plan = self.gw.declare_plan(token, run_id, payload)
+                plan = self.gw.declare_plan(self._cred("declare_plan"), run_id, payload)
             except Denied as exc:
                 if exc.reason in ("DENY_REVOKED", "DENY_RUN_ENDED") or self._revoked(token):
                     raise
@@ -296,8 +318,8 @@ class MasterAgent:
             },
         ]
         answer = self._chat(answer_messages, None).content or "(no answer)"
-        self.gw.report_progress(token, run_id, "answered")
-        self.gw.finish_run(token, run_id, answer.strip())
+        self.gw.report_progress(self._cred("report_progress"), run_id, "answered")
+        self.gw.finish_run(self._cred("finish_run"), run_id, answer.strip())
 
     def _execute(self, token: str, run_id: str, plan: dict[str, Any], fault: str | None) -> list:
         results: list[dict[str, Any]] = []
@@ -308,7 +330,7 @@ class MasterAgent:
                 results.append({**step, "status": "skipped (an earlier step failed)"})
                 continue
             try:
-                out = self.gw.consult(token, lease["lease_id"])
+                out = self.gw.consult(self._cred("consult"), lease["lease_id"])
                 results.append(
                     {**step, "status": "ok", "by": out["agent"], "result": out["result"]}
                 )
@@ -324,12 +346,14 @@ class MasterAgent:
     def _spin(self, token: str, run_id: str) -> None:
         """Simulated stuck agent: keeps polling, never makes progress."""
         while True:
-            self.gw.heartbeat(token, run_id)  # raises Denied once the watchdog revokes us
+            self.gw.heartbeat(
+                self._cred("heartbeat"), run_id
+            )  # raises Denied once the watchdog revokes us
             self._sleep(0.5)
 
     def _revoked(self, token: str) -> bool:
         try:
-            self.gw.check_badge(token)
+            self.gw.check_badge(self._token)
             return False
         except Denied:
             return True

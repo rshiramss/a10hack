@@ -7,6 +7,7 @@ const KEY_KINDS = new Set([
   "SPAWNED", "AUTHENTICATED", "AUTH_FAILED", "RUN_STARTED", "RUN_ENDED", "PLAN_APPROVED",
   "DENIED", "REVOKED", "HANDSHAKE_REFUSED", "OUTPUT_REJECTED", "RESULT_DISCARDED",
   "FORGERY_REFUSED", "INJECTION_FLAGGED", "DELIVERED", "OPERATOR_LOGIN", "OPERATOR_LOGIN_FAILED",
+  "POP_REJECTED", "ATTESTATION_FAILED",
 ]);
 const ICON = { ALLOW: "✓", DENY: "✗", EVENT: "•" };
 
@@ -108,8 +109,13 @@ function agentCard(agent, busy) {
     ]),
     el("div", { class: "row" }, [
       el("span", { class: "meta", text: agent.badge
-        ? `badge ${agent.badge}${agent.status === "active" ? ` · ${agent.expires_in}s left` : ""}` : "no badge" }),
+        ? `badge ${agent.badge}${agent.status === "active" ? ` · ${agent.expires_in}s left` : ""}` : "no badge issued" }),
       agent.status === "active" ? revoke : null,
+    ]),
+    el("div", { class: "idline" }, [
+      agent.attested ? el("span", { class: "id-ok", text: "✓ code attested" })
+        : agent.attestation_failed ? el("span", { class: "id-bad", text: "✗ attestation failed" }) : null,
+      agent.key ? el("span", { class: "id-ok", text: `🔑 key ${agent.key}` }) : null,
     ]),
     agent.run_id ? el("div", { class: "meta", text: `for ${agent.run_id}` }) : null,
     agent.end_reason && agent.status !== "active" ? el("div", { class: "end-reason", text: agent.end_reason }) : null,
@@ -198,6 +204,7 @@ function renderRun(snap) {
             el("span", { class: "agent-ref", text: step.instance || step.agent }), `.${step.tool}(${args})`,
           ]),
           el("div", { class: "handshake" }, [
+            chip("signed call", true),
             chip("lease", true),
             chip("delegation signed", kinds.includes("DELEGATED")),
             chip("sealed AES-GCM", kinds.includes("DELEGATED")),
@@ -336,10 +343,13 @@ document.addEventListener("DOMContentLoaded", () => {
   $("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) send(e); });
   for (const id of ["watchdog-seconds", "step-delay", "replace"]) $(id).addEventListener("change", saveSettings);
   $("step-delay").addEventListener("input", () => { $("step-delay-text").textContent = `${$("step-delay").value} ms`; });
-  $("rogue").addEventListener("click", async () => {
-    const r = await post("/api/rogue");
+  const attack = (id, path) => $(id).addEventListener("click", async () => {
+    const r = await post(path);
     say(r.ok ? r.results.map((x) => `${x.attempt}: ${human(x.result)}`).join(" · ") : r.reason, r.ok);
   });
+  attack("rogue", "/api/rogue");
+  attack("steal", "/api/attack/steal");
+  attack("tampered", "/api/attack/tampered");
   $("reset").addEventListener("click", async () => {
     const r = await post("/api/reset");
     state.examplesShown = false; state.settingsShown = false;

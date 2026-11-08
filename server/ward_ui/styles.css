@@ -156,8 +156,14 @@ button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
 .stamp.active { color: var(--allow); }
 .stamp.revoked { color: var(--deny); }
 .stamp.retired { color: var(--retired); }
+.idline { display: flex; flex-wrap: wrap; gap: 0.15rem 0.5rem; font-size: 0.62rem; margin-top: 0.15rem; }
+.id-ok { color: var(--allow); }
+.id-bad { color: var(--deny); font-weight: 800; }
 .end-reason { font-size: var(--text-xs); color: var(--deny); margin-top: 0.2rem; }
-.agent.retired .end-reason { color: var(--muted); }
+.agent.retired .idline { display: flex; flex-wrap: wrap; gap: 0.15rem 0.5rem; font-size: 0.62rem; margin-top: 0.15rem; }
+.id-ok { color: var(--allow); }
+.id-bad { color: var(--deny); font-weight: 800; }
+.end-reason { color: var(--muted); }
 
 /* ---- plan steps ---- */
 .watchdog { margin-bottom: 0.8rem; }

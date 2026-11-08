@@ -20,6 +20,7 @@ from typing import Any
 import jwt
 
 from ward import crypto
+from ward.attestation import measure
 from ward.config import WardConfig
 from ward.tools import TOOLS
 
@@ -48,6 +49,7 @@ class SpecialistInstance:
         config: WardConfig,
         gateway_public_pem: str,
         master_role: str,
+        functions: dict[str, Any] | None = None,
     ) -> None:
         self.agent_id = agent_id
         self.role = role
@@ -56,6 +58,26 @@ class SpecialistInstance:
         self._gateway_public_pem = gateway_public_pem
         self._master_role = master_role
         self.session: Session | None = None
+        # The instance's own key pair; the private half never leaves this object.
+        self.key = crypto.AgentKey()
+        # The code this instance would run. Attestation hashes exactly this.
+        self._functions = functions or {t: TOOLS[t] for t in config.roles[role].tools}
+
+    def measurement(self) -> str:
+        return measure(self.role, self._config, self._functions)
+
+    def login(self, gateway: Any) -> None:
+        """Present secret + public key (with proof of possession) + code measurement."""
+        session = gateway.authenticate(
+            self.agent_id,
+            self._secret,
+            self.key.public_pem,
+            self.key.proof(self._secret, "authenticate"),
+            self.measurement(),
+        )
+        self.adopt_session(
+            session["token"], session["jti"], session["seal_key"], session["proof_key"]
+        )
 
     @property
     def client_secret(self) -> str:
@@ -87,10 +109,18 @@ class SpecialistInstance:
         if request["tool"] not in self._config.roles[self.role].tools:
             raise OfferRefused("DENY_ROLE_FORBIDDEN", f"{self.role} doesn't own {request['tool']}")
         proof = crypto.hmac_hex(self.session.proof_key, f"{challenge}:{claims['lease']}")
-        return {"accept": True, "proof": proof, "badge": self.session.badge, "request": request}
+        pop = self.key.sign(f"{challenge}:{claims['lease']}")
+        return {
+            "accept": True,
+            "proof": proof,
+            "pop": pop,
+            "badge": self.session.badge,
+            "request": request,
+        }
 
     def run_tool(self, conn: sqlite3.Connection, request: dict[str, Any], lease_id: str) -> dict:
         """Run the atomic function and seal its typed result back to the gateway."""
         assert self.session is not None
-        output = TOOLS[request["tool"]](conn, self._config, request["args"], request["inputs"])
+        function = self._functions[request["tool"]]
+        output = function(conn, self._config, request["args"], request["inputs"])
         return crypto.seal(self.session.seal_key, output, f"result:{lease_id}")

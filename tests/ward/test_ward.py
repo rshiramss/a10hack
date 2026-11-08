@@ -14,12 +14,40 @@ from fastapi.testclient import TestClient
 from server.ward_app import create_app
 from tests.ward.fakes import FakeLLM, done_turn, plan_turn, text_turn
 from ward import crypto
+from ward.attestation import master_functions, measure
 from ward.config import ConfigError, load_config
-from ward.gateway import Denied, Gateway
+from ward.gateway import Credential, Denied, Gateway
 from ward.master import MasterAgent, _example_plan
 from ward.specialist import OfferRefused
+from ward.tools import TOOLS
 
 CFG = load_config()
+
+
+class Caller:
+    """A logged-in agent for tests: its own key, a key-bound badge, signed calls."""
+
+    def __init__(self, gw: Gateway, role: str, functions: dict | None = None) -> None:
+        self.agent_id, secret = gw.provision(role)
+        self.key = crypto.AgentKey()
+        if functions is None:
+            functions = (
+                master_functions()
+                if role == CFG.master_role
+                else {t: TOOLS[t] for t in CFG.roles[role].tools}
+            )
+        session = gw.authenticate(
+            self.agent_id,
+            secret,
+            self.key.public_pem,
+            self.key.proof(secret, "authenticate"),
+            measure(role, CFG, functions),
+        )
+        self.token = session["token"]
+        self.session = session
+
+    def __call__(self, op: str) -> Credential:
+        return Credential(self.token, self.key.proof(self.token, op))
 
 
 def rx_plan(patient: str, drug: str, dose: int, renal: bool = True) -> list[dict[str, Any]]:
@@ -58,43 +86,104 @@ def gw() -> Gateway:
 
 @pytest.fixture
 def master(gw: Gateway) -> tuple[Gateway, str]:
-    agent_id, secret = gw.provision(CFG.master_role)
-    return gw, gw.authenticate(agent_id, secret)["token"]
+    return gw, Caller(gw, CFG.master_role)
 
 
-def run_plan(gw: Gateway, token: str, steps: list[dict]) -> tuple[str, list[dict]]:
-    run_id = gw.start_run(token, "test")
-    plan = gw.declare_plan(token, run_id, steps)
-    return run_id, [gw.consult(token, lease["lease_id"]) for lease in plan["leases"]]
+def run_plan(gw: Gateway, token: Caller, steps: list[dict]) -> tuple[str, list[dict]]:
+    run_id = gw.start_run(token("start_run"), "test")
+    plan = gw.declare_plan(token("declare_plan"), run_id, steps)
+    return run_id, [gw.consult(token("consult"), lease["lease_id"]) for lease in plan["leases"]]
 
 
 # ---- identity ----------------------------------------------------------------------------
 
 
+def labs_login(gw: Gateway, agent_id: str, secret: str, key: crypto.AgentKey) -> dict:
+    fns = {t: TOOLS[t] for t in CFG.roles["labs"].tools}
+    return gw.authenticate(
+        agent_id,
+        secret,
+        key.public_pem,
+        key.proof(secret, "authenticate"),
+        measure("labs", CFG, fns),
+    )
+
+
 def test_instances_get_numbered_names_and_their_own_badges(gw: Gateway) -> None:
-    first, s1 = gw.provision("pharmacy")
-    second, s2 = gw.provision("pharmacy")
-    assert (first, second) == ("PharmacyAgent1", "PharmacyAgent2")
-    b1, b2 = gw.authenticate(first, s1), gw.authenticate(second, s2)
-    assert b1["jti"] != b2["jti"] and b1["seal_key"] != b2["seal_key"]
+    a, b = Caller(gw, "pharmacy"), Caller(gw, "pharmacy")
+    assert (a.agent_id, b.agent_id) == ("PharmacyAgent1", "PharmacyAgent2")
+    assert a.session["jti"] != b.session["jti"]
+    assert a.session["seal_key"] != b.session["seal_key"]
 
 
 def test_bad_secret_and_revoked_agents_cannot_authenticate(gw: Gateway) -> None:
     agent_id, secret = gw.provision("labs")
+    key = crypto.AgentKey()
     with pytest.raises(Denied, match="DENY_BAD_CREDENTIALS"):
-        gw.authenticate(agent_id, "nope")
+        labs_login(gw, agent_id, "nope", key)
     gw.revoke(agent_id, "test", "test")
     with pytest.raises(Denied, match="DENY_REVOKED"):
-        gw.authenticate(agent_id, secret)
+        labs_login(gw, agent_id, secret, key)
+
+
+def test_badge_is_bound_to_the_agents_key(gw: Gateway) -> None:
+    session = Caller(gw, "labs").session
+    claims = gw.keys.read_badge(session["token"])
+    assert len(claims["cnf"]["jkt"]) == 64 and claims["att"]
+
+
+def test_key_possession_is_proven_at_login(gw: Gateway) -> None:
+    agent_id, secret = gw.provision("labs")
+    mine, someone_elses = crypto.AgentKey(), crypto.AgentKey()
+    fns = {t: TOOLS[t] for t in CFG.roles["labs"].tools}
+    with pytest.raises(Denied, match="DENY_POP_MISMATCH"):
+        gw.authenticate(
+            agent_id,
+            secret,
+            mine.public_pem,
+            someone_elses.proof(secret, "authenticate"),
+            measure("labs", CFG, fns),
+        )
+
+
+def test_tampered_code_gets_no_badge_and_is_quarantined(gw: Gateway) -> None:
+    results = gw.tampered_agent_test()
+    assert results[0]["result"] == "DENY_ATTESTATION"
+    row = gw.conn.execute(
+        "SELECT status, end_reason FROM agents WHERE agent_id = 'MedHistoryAgent1'"
+    ).fetchone()
+    assert row["status"] == "revoked" and "attestation" in row["end_reason"]
+    assert gw.conn.execute("SELECT COUNT(*) FROM badges").fetchone()[0] == 0
+
+
+def test_a_stolen_badge_is_useless_without_the_key(master) -> None:  # noqa: ANN001
+    gw, me = master
+    captured = me("capabilities")
+    gw.capabilities(captured)  # the real call
+    results = gw.steal_badge_test(me.token, captured)
+    assert [r["result"] for r in results] == [
+        "DENY_POP_REPLAY",
+        "DENY_POP_MISMATCH",
+        "DENY_POP_MISSING",
+    ]
+    with pytest.raises(Denied, match="DENY_REVOKED"):
+        gw.check_badge(me.token)  # treated as compromised
+
+
+def test_a_proof_is_only_good_for_its_operation(master) -> None:  # noqa: ANN001
+    gw, me = master
+    with pytest.raises(Denied, match="DENY_POP_MISMATCH"):
+        gw.start_run(me("capabilities"), "t")
 
 
 def test_only_the_master_can_delegate_and_trying_revokes(gw: Gateway) -> None:
-    agent_id, secret = gw.provision("labs")
-    token = gw.authenticate(agent_id, secret)["token"]
+    labs = Caller(gw, "labs")
     with pytest.raises(Denied, match="DENY_NOT_MASTER"):
-        gw.declare_plan(token, "RUN-X", rx_plan("P001", "acetaminophen", 1000))
+        gw.declare_plan(labs("declare_plan"), "RUN-X", rx_plan("P001", "acetaminophen", 1000))
     assert (
-        gw.conn.execute("SELECT status FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()[0]
+        gw.conn.execute(
+            "SELECT status FROM agents WHERE agent_id = ?", (labs.agent_id,)
+        ).fetchone()[0]
         == "revoked"
     )
 
@@ -106,8 +195,10 @@ def test_specialist_refuses_a_delegation_not_signed_by_the_gateway(gw: Gateway) 
 
 def test_delegation_for_another_instance_is_refused(master) -> None:  # noqa: ANN001
     gw, token = master
-    run_id = gw.start_run(token, "t")
-    plan = gw.declare_plan(token, run_id, rx_plan("P001", "acetaminophen", 1000)[:1])
+    run_id = gw.start_run(token("start_run"), "t")
+    plan = gw.declare_plan(
+        token("declare_plan"), run_id, rx_plan("P001", "acetaminophen", 1000)[:1]
+    )
     lease = gw.conn.execute(
         "SELECT * FROM leases WHERE lease_id = ?", (plan["leases"][0]["lease_id"],)
     ).fetchone()
@@ -118,9 +209,8 @@ def test_delegation_for_another_instance_is_refused(master) -> None:  # noqa: AN
     other = SpecialistInstance(
         other_id, "med_history", other_secret, CFG, gw.keys.delegation_public_pem, CFG.master_role
     )
-    s = gw.authenticate(other_id, other_secret)
-    other.adopt_session(s["token"], s["jti"], s["seal_key"], s["proof_key"])
-    master_badge = gw.check_badge(token)
+    other.login(gw)
+    master_badge = gw.check_badge(token.token)
     offer, challenge = gw._offer(master_badge, lease, a, {"patient_id": "P001"}, {})  # noqa: SLF001
     with pytest.raises(OfferRefused, match="DENY_BAD_DELEGATION"):
         other.handle_offer(offer, challenge)  # token's audience is `a`, not `other`
@@ -177,32 +267,32 @@ def test_sealed_consult_only_opens_with_the_target_key() -> None:
 )
 def test_bad_plans_are_rejected(master, steps, reason) -> None:  # noqa: ANN001
     gw, token = master
-    run_id = gw.start_run(token, "t")
+    run_id = gw.start_run(token("start_run"), "t")
     with pytest.raises(Denied) as caught:
-        gw.declare_plan(token, run_id, steps)
+        gw.declare_plan(token("declare_plan"), run_id, steps)
     assert caught.value.reason == reason
 
 
 def test_piped_inputs_must_match_shared_args(master) -> None:  # noqa: ANN001
     gw, token = master
-    run_id = gw.start_run(token, "t")
+    run_id = gw.start_run(token("start_run"), "t")
     steps = rx_plan("P001", "ibuprofen", 400)
     steps[3]["args"]["patient_id"] = "P002"  # interactions for a different patient's meds
     with pytest.raises(Denied, match="DENY_PRECONDITION"):
-        gw.declare_plan(token, run_id, steps)
+        gw.declare_plan(token("declare_plan"), run_id, steps)
 
 
 def test_three_denials_revoke_the_master(master) -> None:  # noqa: ANN001
     gw, token = master
-    run_id = gw.start_run(token, "t")
+    run_id = gw.start_run(token("start_run"), "t")
     bad = [{"agent": "LabsAgent", "tool": "get_renal_function", "args": {"patient_id": "x"}}]
     for _ in range(2):
         with pytest.raises(Denied):
-            gw.declare_plan(token, run_id, bad)
+            gw.declare_plan(token("declare_plan"), run_id, bad)
     with pytest.raises(Denied):
-        gw.consult(token, "L-NOPE")
+        gw.consult(token("consult"), "L-NOPE")
     with pytest.raises(Denied, match="DENY_REVOKED"):
-        gw.check_badge(token)
+        gw.check_badge(token.token)
 
 
 # ---- consults ------------------------------------------------------------------------------
@@ -230,11 +320,11 @@ def test_major_interaction_and_renal_block(master) -> None:  # noqa: ANN001
 
 def test_injected_record_never_leaves_the_specialist(master) -> None:  # noqa: ANN001
     gw, token = master
-    run_id = gw.start_run(token, "t")
-    plan = gw.declare_plan(token, run_id, rx_plan("P007", "acetaminophen", 1000))
-    gw.consult(token, plan["leases"][0]["lease_id"])
+    run_id = gw.start_run(token("start_run"), "t")
+    plan = gw.declare_plan(token("declare_plan"), run_id, rx_plan("P007", "acetaminophen", 1000))
+    gw.consult(token("consult"), plan["leases"][0]["lease_id"])
     with pytest.raises(Denied, match="DENY_OUTPUT_SCHEMA"):
-        gw.consult(token, plan["leases"][1]["lease_id"])
+        gw.consult(token("consult"), plan["leases"][1]["lease_id"])
     stored = gw.conn.execute(
         "SELECT result_json FROM leases WHERE lease_id = ?", (plan["leases"][1]["lease_id"],)
     ).fetchone()[0]
@@ -243,19 +333,21 @@ def test_injected_record_never_leaves_the_specialist(master) -> None:  # noqa: A
 
 def test_steps_must_run_in_order(master) -> None:  # noqa: ANN001
     gw, token = master
-    run_id = gw.start_run(token, "t")
-    plan = gw.declare_plan(token, run_id, rx_plan("P001", "acetaminophen", 1000))
+    run_id = gw.start_run(token("start_run"), "t")
+    plan = gw.declare_plan(token("declare_plan"), run_id, rx_plan("P001", "acetaminophen", 1000))
     with pytest.raises(Denied, match="DENY_OFF_PLAN"):
-        gw.consult(token, plan["leases"][2]["lease_id"])
+        gw.consult(token("consult"), plan["leases"][2]["lease_id"])
 
 
 def test_a_lease_is_single_use(master) -> None:  # noqa: ANN001
     gw, token = master
-    run_id = gw.start_run(token, "t")
-    plan = gw.declare_plan(token, run_id, rx_plan("P001", "acetaminophen", 1000)[:1])
-    gw.consult(token, plan["leases"][0]["lease_id"])
+    run_id = gw.start_run(token("start_run"), "t")
+    plan = gw.declare_plan(
+        token("declare_plan"), run_id, rx_plan("P001", "acetaminophen", 1000)[:1]
+    )
+    gw.consult(token("consult"), plan["leases"][0]["lease_id"])
     with pytest.raises(Denied, match="DENY_LEASE_USED"):
-        gw.consult(token, plan["leases"][0]["lease_id"])
+        gw.consult(token("consult"), plan["leases"][0]["lease_id"])
 
 
 # ---- revocation mid-call ---------------------------------------------------------------------
@@ -275,31 +367,35 @@ def revoke_during_sleep(gw: Gateway, pick) -> None:  # noqa: ANN001
 
 def test_revoked_specialist_is_replaced_by_a_fresh_instance(master) -> None:  # noqa: ANN001
     gw, token = master
-    run_id = gw.start_run(token, "t")
-    plan = gw.declare_plan(token, run_id, rx_plan("P001", "acetaminophen", 1000)[:1])
+    run_id = gw.start_run(token("start_run"), "t")
+    plan = gw.declare_plan(
+        token("declare_plan"), run_id, rx_plan("P001", "acetaminophen", 1000)[:1]
+    )
     revoke_during_sleep(gw, lambda: "MedHistoryAgent1")
-    out = gw.consult(token, plan["leases"][0]["lease_id"])
+    out = gw.consult(token("consult"), plan["leases"][0]["lease_id"])
     assert out["agent"] == "MedHistoryAgent2"
 
 
 def test_revoked_specialist_fails_the_step_without_replacement(master) -> None:  # noqa: ANN001
     gw, token = master
     gw.settings["replace_revoked_specialists"] = False
-    run_id = gw.start_run(token, "t")
-    plan = gw.declare_plan(token, run_id, rx_plan("P001", "acetaminophen", 1000)[:1])
+    run_id = gw.start_run(token("start_run"), "t")
+    plan = gw.declare_plan(
+        token("declare_plan"), run_id, rx_plan("P001", "acetaminophen", 1000)[:1]
+    )
     revoke_during_sleep(gw, lambda: "MedHistoryAgent1")
     with pytest.raises(Denied, match="DENY_REVOKED"):
-        gw.consult(token, plan["leases"][0]["lease_id"])
+        gw.consult(token("consult"), plan["leases"][0]["lease_id"])
 
 
 def test_revoking_the_master_aborts_the_run_and_retires_specialists(master) -> None:  # noqa: ANN001
     gw, token = master
-    run_id = gw.start_run(token, "t")
-    plan = gw.declare_plan(token, run_id, rx_plan("P001", "acetaminophen", 1000))
-    master_id = gw.check_badge(token).agent_id
+    run_id = gw.start_run(token("start_run"), "t")
+    plan = gw.declare_plan(token("declare_plan"), run_id, rx_plan("P001", "acetaminophen", 1000))
+    master_id = gw.check_badge(token.token).agent_id
     revoke_during_sleep(gw, lambda: master_id)
     with pytest.raises(Denied):
-        gw.consult(token, plan["leases"][0]["lease_id"])
+        gw.consult(token("consult"), plan["leases"][0]["lease_id"])
     run = gw.conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
     assert run["status"] == "aborted"
     statuses = {
@@ -317,12 +413,12 @@ def test_revoking_the_master_aborts_the_run_and_retires_specialists(master) -> N
 def test_watchdog_revokes_a_master_with_no_progress(master) -> None:  # noqa: ANN001
     gw, token = master
     gw.settings["watchdog_seconds"] = 0.05
-    run_id = gw.start_run(token, "t")
+    run_id = gw.start_run(token("start_run"), "t")
     time.sleep(0.1)
-    gw.heartbeat(token, run_id)  # pinging isn't progress
+    gw.heartbeat(token("heartbeat"), run_id)  # pinging isn't progress
     gw.watchdog_tick()
     with pytest.raises(Denied, match="DENY_REVOKED"):
-        gw.heartbeat(token, run_id)
+        gw.heartbeat(token("heartbeat"), run_id)
 
 
 def test_audit_chain_detects_tampering(master) -> None:  # noqa: ANN001
@@ -378,7 +474,7 @@ def test_a_revoked_master_is_replaced_by_a_new_identity(gw: Gateway) -> None:
 
 def test_planner_prompt_comes_from_policy(master) -> None:  # noqa: ANN001
     gw, token = master
-    caps = gw.capabilities(token)
+    caps = gw.capabilities(token("capabilities"))
     assert {c["tool"] for c in caps} == set(CFG.tools)
     example = _example_plan(caps)
     assert "steps" in example

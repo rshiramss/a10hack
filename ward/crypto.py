@@ -117,3 +117,82 @@ def verify_delegation(public_pem: str, token: str, audience: str) -> dict[str, A
         issuer=ISSUER,
         options={"require": ["exp", "aud", "sub", "jti", "lease", "tool", "args_sha256"]},
     )
+
+
+# ---- 6. proof of possession (DPoP-style) ------------------------------------------------
+#
+# Each agent generates its own Ed25519 key pair; the private half never leaves the agent.
+# Its badge is bound to the public key's thumbprint (cnf.jkt), and every call carries a
+# fresh proof signed with the private key: which operation, a hash of the badge, a time,
+# and a one-time id. A stolen badge without the key is useless; a captured proof can't be
+# replayed.
+
+POP_MAX_SKEW_S = 30
+
+
+def thumbprint(public_pem: str) -> str:
+    return hashlib.sha256(public_pem.encode()).hexdigest()
+
+
+class AgentKey:
+    """An agent's own signing key. Lives only inside the agent."""
+
+    def __init__(self) -> None:
+        self._private = Ed25519PrivateKey.generate()
+        self.public_pem = (
+            self._private.public_key()
+            .public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            .decode()
+        )
+        self.jkt = thumbprint(self.public_pem)
+
+    def proof(self, token: str, op: str) -> str:
+        import time
+        import uuid
+
+        return jwt.encode(
+            {
+                "op": op,
+                "ath": hashlib.sha256(token.encode()).hexdigest(),
+                "iat": int(time.time()),
+                "jti": uuid.uuid4().hex,
+            },
+            self._private,
+            algorithm="EdDSA",
+        )
+
+    def sign(self, message: str) -> str:
+        return self._private.sign(message.encode()).hex()
+
+
+def verify_proof(public_pem: str, proof: str, token: str, op: str, now_s: float) -> dict[str, Any]:
+    """Raises ValueError with a reason code if the proof doesn't hold."""
+    try:
+        claims = jwt.decode(
+            proof,
+            public_pem,
+            algorithms=["EdDSA"],
+            options={"require": ["op", "ath", "iat", "jti"]},
+        )
+    except jwt.PyJWTError as exc:
+        raise ValueError("DENY_POP_MISMATCH") from exc
+    if claims["ath"] != hashlib.sha256(token.encode()).hexdigest():
+        raise ValueError("DENY_POP_MISMATCH")
+    if claims["op"] != op:
+        raise ValueError("DENY_POP_MISMATCH")
+    if abs(now_s - claims["iat"]) > POP_MAX_SKEW_S:
+        raise ValueError("DENY_POP_STALE")
+    return claims
+
+
+def verify_signature(public_pem: str, message: str, signature_hex: str) -> bool:
+    from cryptography.exceptions import InvalidSignature
+
+    key = serialization.load_pem_public_key(public_pem.encode())
+    try:
+        key.verify(bytes.fromhex(signature_hex), message.encode())
+        return True
+    except (InvalidSignature, ValueError):
+        return False

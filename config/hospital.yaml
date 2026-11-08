@@ -8,7 +8,7 @@ system_id: WARD-01
 identity:
   badge_ttl_seconds: 300          # every agent badge, master included
   delegation_ttl_seconds: 60      # one consult's delegation token
-  spare_instances: 0
+  revoke_on_pop_failure: true    # a badge used without its key is treated as stolen
 
 run:
   max_plans_per_run: 3            # a plan can depend on an earlier plan's typed results
