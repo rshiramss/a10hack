@@ -1018,3 +1018,37 @@ def test_steal_demo_covers_the_pre_rotation_pair(gw: Gateway) -> None:
         "DENY_POP_MISMATCH",
         "DENY_POP_MISSING",
     ]
+
+
+def test_rotation_mid_call_lets_that_call_finish_but_not_the_next(master) -> None:  # noqa: ANN001
+    """Rotation is routine: the in-flight call completes; the old badge then stops working.
+    (Contrast: revocation mid-call discards the result. See the revoke tests above.)"""
+    gw, me = master
+    run_id = gw.start_run(me("start_run"), "t")
+    plan = gw.declare_plan(
+        me("declare_plan"),
+        run_id,
+        [
+            step("LabsAgent", "get_renal_function", patient_id="P001"),
+            step("LabsAgent", "get_latest_labs", patient_id="P001"),
+        ],
+    )
+    old_token, old_key = me.token, me.key
+    in_flight = me("consult")  # the call starts with the old badge
+    fired = []
+
+    def rotate_mid_call(_: float) -> None:
+        if not fired:
+            fired.append(True)
+            rotate(gw, me)  # the master's scheduled rotation lands mid-call
+
+    gw._sleep = rotate_mid_call  # noqa: SLF001
+    out = gw.consult(in_flight, plan["leases"][0]["lease_id"])
+    assert out["result"]["band"] == "mild"  # delivered: rotation didn't cut it off
+    gw._sleep = lambda s: None  # noqa: SLF001
+    with pytest.raises(Denied, match="DENY_BADGE_SUPERSEDED"):
+        gw.consult(
+            Credential(old_token, old_key.proof(old_token, "consult")),
+            plan["leases"][1]["lease_id"],
+        )
+    assert gw.consult(me("consult"), plan["leases"][1]["lease_id"])["result"]["glucose"] == 148
