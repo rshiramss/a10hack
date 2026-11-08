@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Badge · Ward</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,800&family=JetBrains+Mono:wght@400;600;800&display=swap">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="brand">
+      <h1>Badge <span class="brand-sub">· Ward</span></h1>
+      <p class="tagline">Identity &amp; access control for hospital AI agents &middot; <span id="system-id">…</span></p>
+    </div>
+    <div class="masthead-right">
+      <div class="totals" aria-label="Decision totals">
+        <span class="total allow"><b id="total-allow">0</b> allowed</span>
+        <span class="total deny"><b id="total-deny">0</b> denied</span>
+      </div>
+      <div id="chain-seal" class="seal" role="status">chain …</div>
+      <div class="session">
+        <span id="operator-name"></span>
+        <button id="logout" class="link-button" type="button" hidden>sign out</button>
+      </div>
+    </div>
+  </header>
+
+  <section id="login" class="login" hidden>
+    <form id="login-form" class="login-card">
+      <h2>Operator sign-in</h2>
+      <p class="muted">You're the human in the loop: you can revoke any agent at any time.</p>
+      <label>Username <input name="username" autocomplete="username" required maxlength="32"></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required maxlength="128"></label>
+      <button type="submit" class="primary">Sign in</button>
+      <p class="muted small">Demo logins: <code>alice / alice123</code>, <code>bob / bob123</code> (set <code>WARD_OPERATORS</code> to change).</p>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </section>
+
+  <main id="console" class="console" hidden>
+    <div class="left">
+      <section class="panel network" aria-labelledby="network-heading">
+        <div class="panel-head">
+          <h2 id="network-heading">Agent network</h2>
+          <span class="muted small">Agents never talk to each other. Every arrow goes through the gateway.</span>
+        </div>
+        <div id="master-row" class="master-row"></div>
+        <div class="gateway-bar"><span>GATEWAY</span><small>policy check · lease · delegation · sealed consult · handshake · typed output</small></div>
+        <div id="lanes" class="lanes"></div>
+      </section>
+
+      <section class="panel run" aria-labelledby="run-heading">
+        <div class="panel-head">
+          <h2 id="run-heading">Current plan</h2>
+          <span id="run-meta" class="muted small"></span>
+        </div>
+        <div id="watchdog" class="watchdog" hidden>
+          <div class="watchdog-label"><span>Watchdog</span><span id="watchdog-text"></span></div>
+          <div class="watchdog-track"><div id="watchdog-fill" class="watchdog-fill"></div></div>
+        </div>
+        <ol id="steps" class="steps"></ol>
+        <p id="run-empty" class="muted">Send a request in the chat. The master agent plans which specialists to consult; the gateway checks the plan and mints one lease per step.</p>
+      </section>
+
+      <section class="panel log" aria-labelledby="log-heading">
+        <div class="panel-head">
+          <h2 id="log-heading">Security log</h2>
+          <div class="seg" role="group" aria-label="Log detail">
+            <button type="button" class="seg-btn on" data-filter="key">Key events</button>
+            <button type="button" class="seg-btn" data-filter="all">Everything</button>
+          </div>
+        </div>
+        <ol id="log" class="log-feed"></ol>
+      </section>
+    </div>
+
+    <aside class="panel chat" aria-labelledby="chat-heading">
+      <div class="panel-head">
+        <h2 id="chat-heading">Chat with the master agent</h2>
+      </div>
+      <div id="master-id" class="master-id"></div>
+      <div id="llm-warning" class="llm-warning" hidden></div>
+      <ol id="messages" class="messages"></ol>
+      <details class="examples-wrap" open>
+        <summary class="small">Example requests</summary>
+        <div id="examples" class="examples"></div>
+      </details>
+      <form id="chat-form" class="chat-form">
+        <textarea id="prompt" rows="3" maxlength="2000" placeholder="Ask about a patient (P001–P008), a drug, or an order…"></textarea>
+        <div class="chat-actions">
+          <label class="toggle" title="The master stalls after its first consult; the watchdog revokes it."><input id="stuck" type="checkbox"> stuck-agent mode</label>
+          <button id="send" type="submit" class="primary">Send</button>
+        </div>
+      </form>
+      <details class="controls">
+        <summary><h3>Demo controls</h3></summary>
+        <label>Watchdog <input id="watchdog-seconds" type="number" min="3" max="300" step="1"> s</label>
+        <label>Step pace <input id="step-delay" type="range" min="0" max="3000" step="100"> <span id="step-delay-text"></span></label>
+        <label class="toggle"><input id="replace" type="checkbox"> replace a revoked specialist once</label>
+        <div class="control-buttons">
+          <button id="rogue" type="button">Rogue agent test</button>
+          <button id="reset" type="button" class="danger-outline">Reset</button>
+        </div>
+      </details>
+      <p id="control-status" class="status-line small" role="status"></p>
+    </aside>
+  </main>
+</body>
+</html>

@@ -1,4 +1,52 @@
-# Badge: Chinese walls for AI agents
+# Badge: identity and access control for AI agents
+
+## Ward console (the demo)
+
+```bash
+uv sync
+ollama pull qwen2.5:3b            # the master agent's brain; Ollama must be running
+uv run python -m scripts.ward     # open http://127.0.0.1:8000/  ·  sign in: alice / alice123
+```
+
+A chat on the right talks to **OrchestratorAgent**, the master agent (a small local LLM).
+It can't see patient data. It plans which specialist agents to consult, and a gateway runs
+the plan. Specialists (MedHistoryAgent, PharmacyAgent, LabsAgent, InsuranceAgent,
+PrescriberAgent) are spun up per request with numbered identities (PharmacyAgent1, 2, ...),
+each owning its own tools and records. Nothing about any request is scripted: the policy
+file `config/hospital.yaml` defines roles, tools, typed inputs/outputs, and limits; the
+model decides the plan at run time.
+
+Every consult is a two-way handshake through the gateway. Agents never exchange
+natural language, only schema-checked typed values:
+
+1. **Plan check.** The master declares every step up front. The gateway rejects wrong
+   agent/tool pairs, bad argument values, missing prerequisite steps, and loops, then mints
+   one single-use **lease** per step.
+2. **Spin up + authenticate.** The specialist instance gets a workload secret (stored only as
+   an HMAC) and trades it for a short-lived **badge** (JWT).
+3. **Delegation.** The gateway signs an **Ed25519 delegation token** for that one instance,
+   bound to the master's badge, the lease, and a hash of the args. Specialists accept work
+   only from a master's delegation, verified with the gateway's public key.
+4. **Sealed consult.** The request is encrypted with **AES-256-GCM** under a key tied to the
+   target's current badge, so only that instance can read it.
+5. **Proof.** The instance answers an HMAC challenge, runs one atomic tool, and seals the
+   typed result back. The gateway validates it against the output schema (a poisoned record
+   is quarantined, never forwarded) and pipes typed values to later steps.
+
+Demo controls: **Revoke** any agent at any moment (a revoked specialist is replaced by a
+fresh instance once; a revoked master aborts its run), **stuck-agent mode** (the watchdog
+revokes a master that makes no progress for N seconds), **Rogue agent test** (a specialist
+tries to call another one, through and around the gateway), and **Reset**. Every decision
+lands in a hash-chained, append-only audit log, shown as the security log.
+
+Switch models with `BADGE_LLM_PROVIDER=openai BADGE_LLM_BASE_URL=... BADGE_LLM_API_KEY=...
+BADGE_MODEL=...` (Groq works). Synthetic data only; not medical advice.
+
+---
+
+## Original trial demo
+
+### Badge: Chinese walls for AI agents
 
 Badge is a security gateway between AI agents and their tools. Every agent gets an
 identity (a signed **badge**), must **declare its tool calls up front**, and can act only
