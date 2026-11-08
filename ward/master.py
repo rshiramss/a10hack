@@ -411,7 +411,19 @@ class MasterAgent:
         try:
             self._handle(token, run_id, prompt, fault)
         except Denied as exc:
-            self.gw.fail_run(run_id, f"{exc.reason}: {exc.detail}")
+            # Master/run aborted mid-flight: still return whatever typed results landed
+            # so MCP ask_ward can answer Cursor with a partial report.
+            partial = self.gw.used_results(run_id)
+            if partial:
+                summary = (
+                    f"Stopped early ({exc.reason}): an identity was revoked. "
+                    f"Results gathered before the stop:\n{json.dumps(partial, indent=1)}"
+                )
+                self.gw.seal_run(
+                    run_id, "aborted", answer=summary, error=f"{exc.reason}: {exc.detail}"
+                )
+            else:
+                self.gw.fail_run(run_id, f"{exc.reason}: {exc.detail}")
         except Exception as exc:  # noqa: BLE001 - surface any model/network failure in the UI
             self.gw.fail_run(run_id, f"{type(exc).__name__}: {str(exc)[:200]}")
         return run_id
@@ -446,9 +458,13 @@ class MasterAgent:
         done: list[tuple[str, dict[str, Any]]] = []
         must_replan = False
         while plans_used < max_plans:
+            if self.gw.stop_requested(run_id):
+                break
             # After a rejected plan the model must fix it: answer_directly isn't offered.
             tools = [PLAN_TOOL] if must_replan else [PLAN_TOOL, NO_CONSULT_TOOL]
             message = self._chat(messages, tools)
+            if self.gw.stop_requested(run_id):
+                break
             kind, payload = _extract_steps(message)
             if kind == "plan":
                 payload = _normalize_steps(payload, caps)
@@ -520,7 +536,11 @@ class MasterAgent:
             new = self._execute(token, run_id, plan, fault)
             results.extend(new)
             done.extend((r["tool"], r["args"]) for r in new if r["status"] == "ok")
-            if plans_used >= max_plans or any(r["status"] != "ok" for r in new):
+            if (
+                plans_used >= max_plans
+                or any(r["status"] != "ok" for r in new)
+                or self.gw.stop_requested(run_id)
+            ):
                 break
             messages.append(
                 {
@@ -530,6 +550,18 @@ class MasterAgent:
                     ),
                 }
             )
+            if self.gw.stop_requested(run_id):
+                break
+        # Operator revoked a specialist: skip another slow LLM answer call — return
+        # typed evidence immediately so Cursor gets a partial and the watchdog stays quiet.
+        if self.gw.stop_requested(run_id):
+            summary = (
+                "Stopped after an operator revoke. No further specialist calls. "
+                f"Results gathered so far:\n{json.dumps(results, indent=1)}"
+            )
+            self.gw.report_progress(self._cred("report_progress"), run_id, "stopped after revoke")
+            self.gw.finish_run(self._cred("finish_run"), run_id, summary)
+            return
         answer_messages = [
             {"role": "system", "content": ANSWER_PROMPT},
             {
@@ -547,7 +579,7 @@ class MasterAgent:
         for index, lease in enumerate(plan["leases"]):
             step = {"agent": lease["agent"], "tool": lease["tool"], "args": lease["args"]}
             if failed:
-                results.append({**step, "status": "skipped (an earlier step failed)"})
+                results.append({**step, "status": "skipped (plan stopped after a revoke/denial)"})
                 continue
             try:
                 out = self.gw.consult(self._cred("consult"), lease["lease_id"])
@@ -555,9 +587,19 @@ class MasterAgent:
                     {**step, "status": "ok", "by": out["agent"], "result": out["result"]}
                 )
             except Denied as exc:
-                if exc.reason in ("DENY_RUN_ENDED",) or self._revoked(token):
+                # Master itself revoked / run aborted → bubble up.
+                if exc.reason == "DENY_RUN_ENDED" or self._revoked(token):
                     raise
-                results.append({**step, "status": "denied", "reason": exc.reason})
+                # Specialist (or its lease) revoked mid-plan: keep prior typed results,
+                # skip everything after, and let the answer step report what we have.
+                results.append(
+                    {
+                        **step,
+                        "status": "denied",
+                        "reason": exc.reason,
+                        "detail": exc.detail,
+                    }
+                )
                 failed = True
             if fault == "stuck" and index == 0:
                 self._spin(token, run_id)  # never returns normally: the watchdog revokes us

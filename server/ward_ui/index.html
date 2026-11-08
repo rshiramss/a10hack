@@ -99,33 +99,17 @@
 
     <aside class="panel chat" aria-labelledby="chat-heading">
       <div class="panel-head">
-        <h2 id="chat-heading">Chat with the master agent</h2>
+        <h2 id="chat-heading">Operator console</h2>
       </div>
-      <div id="master-id" class="master-id"></div>
-      <div id="llm-warning" class="llm-warning" hidden></div>
-      <ol id="messages" class="messages"></ol>
-      <details class="examples-wrap" open>
-        <summary class="small">Example requests</summary>
-        <div id="examples" class="examples"></div>
-      </details>
-      <form id="chat-form" class="chat-form">
-        <textarea id="prompt" rows="3" maxlength="2000" placeholder="Ask about a patient (by name or id, e.g. Jordan or P002), a drug, an order, or coverage…"></textarea>
-        <div class="chat-actions">
-          <label class="toggle" title="The master stalls after its first consult; the watchdog revokes it."><input id="stuck" type="checkbox"> stuck-agent mode</label>
-          <button id="send" type="submit" class="primary">Send</button>
-        </div>
-      </form>
-      <details class="controls">
-        <summary><h3>Demo controls</h3></summary>
-        <label title="Must be longer than the model takes to reply (min 10 s).">Watchdog <input id="watchdog-seconds" type="number" min="10" max="300" step="1"> s <span class="muted small">(min 10)</span></label>
-        <label>Step pace <input id="step-delay" type="range" min="0" max="3000" step="100"> <span id="step-delay-text"></span></label>
-        <label class="toggle"><input id="replace" type="checkbox"> replace a revoked specialist once</label>
+
+      <section class="demo-toolbar" aria-label="Demo controls">
         <div class="control-buttons">
-          <button id="issue-mcp" type="button" title="Provision an external MCP agent and show its secret once.">Issue MCP credential</button>
+          <button id="issue-mcp" type="button" class="primary" title="Provision an external MCP agent and show its secret once.">Issue MCP credential</button>
           <button id="rogue" type="button" title="A specialist tries to call another specialist, through and around the gateway.">Rogue agent</button>
           <button id="steal" type="button" title="An attacker exfiltrates the master's badge and one signed request, then tries to use them.">Steal master's badge</button>
           <button id="tampered" type="button" title="Spawn an agent whose code was modified to hide allergies.">Tampered agent</button>
-          <button id="reset" type="button" class="danger-outline">Reset</button>
+          <button id="clear-history" type="button" title="Clear past runs, retired specialists, and the security log. Keeps MCP credentials and the live master.">Clear history</button>
+          <button id="reset" type="button" class="danger-outline" title="Full wipe: new gateway, new agents, new audit log. Also invalidates MCP credentials — re-Issue after.">Reset</button>
         </div>
         <div id="mcp-issue" class="mcp-issue" hidden>
           <label>Role
@@ -134,8 +118,35 @@
           <button id="mcp-issue-go" type="button" class="primary">Issue</button>
           <pre id="mcp-issue-out" class="mcp-issue-out" hidden></pre>
         </div>
+        <p id="control-status" class="status-line small" role="status"></p>
+        <details class="controls-advanced">
+          <summary class="small">Watchdog &amp; pace</summary>
+          <label title="Must be longer than the model takes to reply (min 10 s).">Watchdog <input id="watchdog-seconds" type="number" min="10" max="300" step="1"> s <span class="muted small">(min 10)</span></label>
+          <label>Step pace <input id="step-delay" type="range" min="0" max="3000" step="100"> <span id="step-delay-text"></span></label>
+          <label class="toggle"><input id="replace" type="checkbox"> replace a revoked specialist once</label>
+        </details>
+      </section>
+
+      <details class="chat-wrap">
+        <summary>
+          <h2>Chat with the master agent</h2>
+          <span class="muted small">fallback if MCP isn’t connected</span>
+        </summary>
+        <div id="master-id" class="master-id"></div>
+        <div id="llm-warning" class="llm-warning" hidden></div>
+        <ol id="messages" class="messages"></ol>
+        <details class="examples-wrap">
+          <summary class="small">Example requests</summary>
+          <div id="examples" class="examples"></div>
+        </details>
+        <form id="chat-form" class="chat-form">
+          <textarea id="prompt" rows="3" maxlength="2000" placeholder="Ask about a patient (by name or id, e.g. Jordan or P002), a drug, an order, or coverage…"></textarea>
+          <div class="chat-actions">
+            <label class="toggle" title="The master stalls after its first consult; the watchdog revokes it."><input id="stuck" type="checkbox"> stuck-agent mode</label>
+            <button id="send" type="submit" class="primary">Send</button>
+          </div>
+        </form>
       </details>
-      <p id="control-status" class="status-line small" role="status"></p>
     </aside>
   </main>
 </body>

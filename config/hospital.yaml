@@ -20,7 +20,7 @@ run:
   watchdog_seconds: 30            # no progress for this long -> the master is revoked
   step_delay_ms: 900              # demo pacing so a human can revoke mid-run
   plan_ttl_seconds: 120           # leases from a plan expire after this
-  replace_revoked_specialists: true  # a revoked specialist is replaced once by a fresh instance
+  replace_revoked_specialists: false # operator Revoke must stick; do not spawn a replacement
 
 # Shared vocabularies. Typed values between agents may only use these.
 vocab:
@@ -53,8 +53,9 @@ vocab:
 #   id    {pattern}        enum {vocab | values}     int {min, max}     bool
 #   list  {items: <type>, max_items}
 # Every role but the master is a specialist: it owns its tools and accepts work only
-# through a delegation from a role listed in `callable_by`.
-# External roles (MCP clients) own no tools; they may_delegate with a tools_allowed list.
+# through a delegation from the orchestrator (callable_by).
+# External MCP clients authenticate to the gateway only — they never see specialist tools.
+# Their sole MCP tool is ask_ward; OrchestratorAgent plans and wires badged specialists.
 roles:
   orchestrator:
     display_name: OrchestratorAgent
@@ -63,68 +64,64 @@ roles:
   clinician_assistant:
     display_name: CursorAgent
     external: true
-    may_delegate: true
-    description: External MCP client (e.g. Cursor). May call every specialist tool.
-    tools_allowed: "*"
+    description: External MCP client (e.g. Cursor). May only ask_ward on the gateway.
   scheduling_assistant:
     display_name: SchedulingBot
     external: true
-    may_delegate: true
-    description: External MCP client limited to scheduling and patient profile.
-    tools_allowed: [find_appointment_slots, book_appointment, get_patient_profile]
+    description: External MCP client (e.g. Claude Code). May only ask_ward on the gateway.
   registration:
     display_name: RegistrationAgent
-    callable_by: [orchestrator, clinician_assistant, scheduling_assistant]
+    callable_by: [orchestrator]
     description: Owns the patient index. Turns a patient's name into their patient id.
     tools: [find_patient, get_patient_profile]
   med_history:
     display_name: MedHistoryAgent
-    callable_by: [orchestrator, clinician_assistant]
+    callable_by: [orchestrator]
     description: Owns medication history, allergy records, and the problem list.
     tools: [get_active_medications, get_allergies, get_problem_list]
   pharmacy:
     display_name: PharmacyAgent
-    callable_by: [orchestrator, clinician_assistant]
+    callable_by: [orchestrator]
     description: Owns the formulary, the drug-interaction table, and pharmacy stock.
     tools: [lookup_drug, check_interactions, check_stock]
   labs:
     display_name: LabsAgent
-    callable_by: [orchestrator, clinician_assistant]
+    callable_by: [orchestrator]
     description: Owns lab results and lab orders.
     tools: [get_renal_function, get_latest_labs, order_lab]
   insurance:
     display_name: InsuranceAgent
-    callable_by: [orchestrator, clinician_assistant]
+    callable_by: [orchestrator]
     description: Owns coverage rules and prior authorizations.
     tools: [check_coverage, request_prior_auth]
   vitals:
     display_name: VitalsAgent
-    callable_by: [orchestrator, clinician_assistant]
+    callable_by: [orchestrator]
     description: Owns bedside vital signs.
     tools: [get_vitals]
   imaging:
     display_name: ImagingAgent
-    callable_by: [orchestrator, clinician_assistant]
+    callable_by: [orchestrator]
     description: Owns radiology studies and their coded findings.
     tools: [get_imaging_results]
   scheduling:
     display_name: SchedulingAgent
-    callable_by: [orchestrator, clinician_assistant, scheduling_assistant]
+    callable_by: [orchestrator]
     description: Owns clinic calendars. Finds open slots and books appointments.
     tools: [find_appointment_slots, book_appointment]
   care_team:
     display_name: CareTeamAgent
-    callable_by: [orchestrator, clinician_assistant]
+    callable_by: [orchestrator]
     description: Owns care-team assignments and the paging system.
     tools: [get_care_team, page_clinician]
   discharge:
     display_name: DischargeAgent
-    callable_by: [orchestrator, clinician_assistant]
+    callable_by: [orchestrator]
     description: Decides discharge readiness, only from typed vitals and labs other agents produced.
     tools: [check_discharge_readiness]
   prescriber:
     display_name: PrescriberAgent
-    callable_by: [orchestrator, clinician_assistant]
+    callable_by: [orchestrator]
     description: Drafts medication orders, only from typed evidence other agents produced.
     tools: [draft_order]
 
@@ -410,7 +407,9 @@ scanners:
 # Demo UI only: example prompts shown as chips in the chat. They are just text sent to the
 # master agent; the plan for each is decided by the model at run time.
 demo:
-  operators: "alice:ward-demo-Qx7m,bob:ward-demo-Kp3v"   # override with WARD_OPERATORS
+  # DEMO_HARDCODE: intentional shared console passwords for the hackathon demo only.
+  # Not production secrets — override with WARD_OPERATORS in a real deploy.
+  operators: "alice:ward-demo-Qx7m,bob:ward-demo-Kp3v"
   examples:
     - "Patient P003 has a sinus infection. Recommend an antibiotic and draft the order."
     - "Can P005 start ibuprofen 1200 mg/day for knee pain? Draft it if it's safe."

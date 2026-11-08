@@ -1,12 +1,14 @@
 # Feature 1: MCP front door + bring-your-own agent
 
+> **Historical plan** (pre-implementation notes). Live behavior: MCP exposes **only
+> `ask_ward`**; OrchestratorAgent wires specialists. See `docs/MCP_DEMO.md`.
+
 ## Goal
 
-Ward's specialist tools are served over real MCP on the **Ward** server (not the old
-trial `server/app.py`). An external MCP client (Cursor via `scripts/badge_agent.py`)
-authenticates as an identity with a role; `tools/list` shows only that role's tools;
-`tools/call` runs the existing lease → delegation → sealed handshake → typed output path;
-the operator can revoke mid-task and the next call is blocked.
+Ward serves an MCP front door on the **Ward** server. An external MCP client (Cursor via
+`scripts/badge_agent.py`) authenticates as an identity; `tools/list` shows `ask_ward` only;
+`ask_ward` runs the existing lease → delegation → sealed handshake → typed output path via
+the orchestrator; the operator can revoke mid-task and the next call is blocked.
 
 ## Current baseline
 

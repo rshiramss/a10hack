@@ -1,8 +1,10 @@
 """Stdio MCP server that Cursor/Claude Code launch. Proxies to Ward's POST /mcp.
 
-Reads WARD_URL, WARD_CLIENT_ID, WARD_CLIENT_SECRET from the environment. Generates its
-own AgentKey, attests (SHA-256 of this file), obtains a badge, rotates every 45s, and
-signs every request. The calling LLM never sees the secret or the badge.
+Credentials come from an operator-issued file (data/mcp-credentials.env via
+WARD_CREDENTIALS_FILE) or WARD_CLIENT_ID / WARD_CLIENT_SECRET. This process
+generates its own Ed25519 AgentKey for PoP, attests (SHA-256 of this file),
+obtains a badge, rotates every 45s, and signs every request. The calling LLM
+never sees the client secret or the badge — and never mints credentials.
 """
 
 from __future__ import annotations
@@ -64,9 +66,15 @@ class BadgeSession:
         r = self._http.post(f"{self.base}/api/agent/token", json=body)
         data = r.json()
         if r.status_code >= 400 or not data.get("ok"):
-            raise SystemExit(
-                f"authenticate failed: {data.get('reason', r.status_code)} {data.get('detail', '')}"
-            )
+            reason = data.get("reason", r.status_code)
+            detail = data.get("detail", "")
+            hint = ""
+            if reason in ("DENY_UNKNOWN_AGENT", "DENY_BAD_CREDENTIALS", "DENY_REVOKED"):
+                hint = (
+                    " — operator must Issue MCP credential in the Ward console "
+                    "(writes data/mcp-credentials.env), then reload Cursor MCP"
+                )
+            raise SystemExit(f"authenticate failed: {reason} {detail}{hint}")
         with self._lock:
             self.token = data["token"]
             self.expires_ms = int(data["expires_ms"])
@@ -145,12 +153,39 @@ def write_message(msg: dict[str, Any]) -> None:
     sys.stdout.buffer.flush()
 
 
+def _load_credentials() -> tuple[str, str]:
+    """Prefer an operator-issued credentials file; fall back to env vars.
+
+    The client secret is minted only by Ward's Issue MCP endpoint. This process
+    generates its own Ed25519 key pair for proof-of-possession — never the secret.
+    """
+    path = os.environ.get("WARD_CREDENTIALS_FILE", "").strip()
+    if not path:
+        default = ROOT / "data" / "mcp-credentials.env"
+        if default.is_file():
+            path = str(default)
+    values: dict[str, str] = {}
+    if path and Path(path).is_file():
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            values[key.strip()] = val.strip().strip("'").strip('"')
+    client_id = os.environ.get("WARD_CLIENT_ID") or values.get("WARD_CLIENT_ID", "")
+    secret = os.environ.get("WARD_CLIENT_SECRET") or values.get("WARD_CLIENT_SECRET", "")
+    return client_id, secret
+
+
 def main() -> None:
     base = os.environ.get("WARD_URL", "http://127.0.0.1:8000")
-    client_id = os.environ.get("WARD_CLIENT_ID", "")
-    secret = os.environ.get("WARD_CLIENT_SECRET", "")
+    client_id, secret = _load_credentials()
     if not client_id or not secret:
-        print("WARD_CLIENT_ID and WARD_CLIENT_SECRET are required", file=sys.stderr)
+        print(
+            "No credentials. Operator must Issue MCP credential in the Ward console "
+            "(writes data/mcp-credentials.env), or set WARD_CLIENT_ID / WARD_CLIENT_SECRET.",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
     session = BadgeSession(base, client_id, secret)
     session.authenticate()

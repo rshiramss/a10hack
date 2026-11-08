@@ -100,7 +100,7 @@ code { background: var(--surface); border: 1px solid var(--hairline); padding: 0
 /* ---- buttons ---- */
 button.primary { background: var(--ink); color: var(--surface); border: 2px solid var(--ink); padding: 0.45rem 1rem; font-weight: 800; }
 button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
-.controls button, .seg-btn {
+.demo-toolbar button, .seg-btn, .control-buttons button {
   background: var(--surface); border: 1.5px solid var(--rule); padding: 0.3rem 0.7rem; font-size: var(--text-sm);
 }
 .danger-outline { color: var(--deny); border-color: var(--deny) !important; }
@@ -249,9 +249,26 @@ button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
 .log-item.fresh { animation: flash 1.2s var(--ease); }
 @keyframes flash { from { background: var(--warn-wash); } to { background: transparent; } }
 
-/* ---- chat ---- */
-.chat { display: flex; flex-direction: column; gap: 0.7rem; overflow: hidden; min-width: 0; }
+/* ---- chat / operator console ---- */
+.chat { display: flex; flex-direction: column; gap: 0.7rem; overflow-x: hidden; overflow-y: auto; min-width: 0; }
 .chat .panel-head { margin-bottom: 0; }
+.demo-toolbar {
+  display: flex; flex-direction: column; gap: 0.55rem;
+  padding: 0.65rem 0.75rem; border: 2px solid var(--rule); background: #fff;
+  flex-shrink: 0; position: sticky; top: 0; z-index: 2;
+}
+.demo-toolbar .control-buttons { display: flex; flex-wrap: wrap; gap: 0.45rem; }
+.demo-toolbar .control-buttons .primary { font-weight: 800; }
+.controls-advanced { font-size: var(--text-sm); border-top: 1px solid var(--hairline); padding-top: 0.4rem; }
+.controls-advanced label { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.35rem; }
+.controls-advanced input[type="number"] { width: 4.5rem; padding: 0.15rem 0.3rem; border: 1px solid var(--rule); background: #fff; }
+.chat-wrap { border-top: 3px double var(--rule); padding-top: 0.5rem; }
+.chat-wrap > summary {
+  cursor: pointer; list-style: none; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem 0.75rem;
+}
+.chat-wrap > summary::-webkit-details-marker { display: none; }
+.chat-wrap > summary h2 { font-size: var(--text-h2); margin: 0; }
+.chat-wrap[open] > :not(summary) { margin-top: 0.55rem; }
 .master-id { font-size: var(--text-xs); color: var(--muted); }
 .master-id b { color: var(--ink); }
 .llm-warning { font-size: var(--text-sm); background: var(--warn-wash); border: 1.5px solid var(--warn); padding: 0.5rem; }
@@ -290,11 +307,12 @@ summary h3 { display: inline; }
 .chat-form textarea { width: 100%; resize: vertical; padding: 0.5rem; border: 1.5px solid var(--rule); background: #fff; }
 .chat-actions { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
 .toggle { display: inline-flex; align-items: center; gap: 0.35rem; font-size: var(--text-sm); }
-.controls { border-top: 3px double var(--rule); padding-top: 0.6rem; font-size: var(--text-sm); }
-.controls[open] > :not(summary) { margin-top: 0.45rem; }
-.controls label { display: flex; align-items: center; gap: 0.4rem; }
-.controls input[type="number"] { width: 4.5rem; padding: 0.15rem 0.3rem; border: 1px solid var(--rule); background: #fff; }
 .control-buttons { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.control-buttons button {
+  border: 1.5px solid var(--rule); background: var(--paper); padding: 0.35rem 0.55rem; font-size: var(--text-sm);
+}
+.control-buttons button.primary { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.control-buttons button.danger-outline { border-color: var(--deny); color: var(--deny); }
 .status-line { min-height: 1.2em; margin: 0; }
 .status-line.good { color: var(--allow); }
 .status-line.bad { color: var(--deny); }

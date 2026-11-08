@@ -213,17 +213,19 @@ def load_config(path: Path | str = DEFAULT_PATH) -> WardConfig:
     for role in roles.values():
         if role.external:
             if role.tools:
-                raise ConfigError(f"external role {role.name} owns no tools; use tools_allowed")
-            if not role.may_delegate:
-                raise ConfigError(f"external role {role.name} must set may_delegate: true")
-            if role.tools_allowed is None:
-                raise ConfigError(f"external role {role.name} needs tools_allowed")
-            if role.tools_allowed != ("*",):
-                for tool in role.tools_allowed:
-                    if tool not in owner_of:
-                        raise ConfigError(f"{role.name}.tools_allowed names unknown tool {tool}")
+                raise ConfigError(f"external role {role.name} owns no tools")
+            if role.may_delegate:
+                raise ConfigError(
+                    f"external role {role.name} must not may_delegate — "
+                    "MCP clients only ask_ward; the orchestrator wires specialists"
+                )
+            if role.tools_allowed is not None:
+                raise ConfigError(
+                    f"external role {role.name} must not set tools_allowed — "
+                    "specialist tools are not exposed over MCP"
+                )
         elif role.may_delegate and not role.master:
-            raise ConfigError(f"{role.name}: may_delegate is only for master/external roles")
+            raise ConfigError(f"{role.name}: may_delegate is only for the master role")
         for caller in role.callable_by:
             if caller not in roles:
                 raise ConfigError(f"{role.name}.callable_by names unknown role {caller}")

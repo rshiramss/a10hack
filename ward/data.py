@@ -11,29 +11,29 @@ from __future__ import annotations
 import sqlite3
 
 CLINICAL_SCHEMA = """
-CREATE TABLE patients   (patient_id TEXT PRIMARY KEY, name TEXT NOT NULL, plan TEXT NOT NULL);
-CREATE TABLE med_list   (patient_id TEXT NOT NULL, drug TEXT NOT NULL);
-CREATE TABLE allergies  (patient_id TEXT NOT NULL, allergen TEXT NOT NULL);
-CREATE TABLE labs       (patient_id TEXT PRIMARY KEY, egfr INTEGER NOT NULL);
-CREATE TABLE formulary  (drug TEXT PRIMARY KEY, drug_class TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS patients   (patient_id TEXT PRIMARY KEY, name TEXT NOT NULL, plan TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS med_list   (patient_id TEXT NOT NULL, drug TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS allergies  (patient_id TEXT NOT NULL, allergen TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS labs       (patient_id TEXT PRIMARY KEY, egfr INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS formulary  (drug TEXT PRIMARY KEY, drug_class TEXT NOT NULL,
                          in_formulary INTEGER NOT NULL, max_daily_mg INTEGER NOT NULL,
                          renal_caution INTEGER NOT NULL, tier INTEGER NOT NULL,
                          prior_auth INTEGER NOT NULL);
-CREATE TABLE interactions (drug_a TEXT NOT NULL, drug_b TEXT NOT NULL, severity TEXT NOT NULL);
-CREATE TABLE profiles   (patient_id TEXT PRIMARY KEY, age INTEGER NOT NULL, primary_care TEXT NOT NULL);
-CREATE TABLE conditions (patient_id TEXT NOT NULL, condition TEXT NOT NULL);
-CREATE TABLE lab_panel  (patient_id TEXT PRIMARY KEY, potassium_x10 INTEGER, inr_x10 INTEGER,
+CREATE TABLE IF NOT EXISTS interactions (drug_a TEXT NOT NULL, drug_b TEXT NOT NULL, severity TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS profiles   (patient_id TEXT PRIMARY KEY, age INTEGER NOT NULL, primary_care TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS conditions (patient_id TEXT NOT NULL, condition TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS lab_panel  (patient_id TEXT PRIMARY KEY, potassium_x10 INTEGER, inr_x10 INTEGER,
                          a1c_x10 INTEGER, glucose INTEGER);
-CREATE TABLE vitals     (patient_id TEXT PRIMARY KEY, systolic INTEGER, diastolic INTEGER,
+CREATE TABLE IF NOT EXISTS vitals     (patient_id TEXT PRIMARY KEY, systolic INTEGER, diastolic INTEGER,
                          heart_rate INTEGER, temp_f_x10 INTEGER, spo2 INTEGER);
-CREATE TABLE imaging    (patient_id TEXT NOT NULL, study TEXT NOT NULL, finding TEXT NOT NULL);
-CREATE TABLE care_team  (patient_id TEXT PRIMARY KEY, attending TEXT NOT NULL, nurse TEXT NOT NULL);
-CREATE TABLE slots      (slot_id TEXT PRIMARY KEY, specialty TEXT NOT NULL, day_offset INTEGER NOT NULL,
+CREATE TABLE IF NOT EXISTS imaging    (patient_id TEXT NOT NULL, study TEXT NOT NULL, finding TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS care_team  (patient_id TEXT PRIMARY KEY, attending TEXT NOT NULL, nurse TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS slots      (slot_id TEXT PRIMARY KEY, specialty TEXT NOT NULL, day_offset INTEGER NOT NULL,
                          patient_id TEXT);
-CREATE TABLE stock      (drug TEXT PRIMARY KEY, units INTEGER NOT NULL);
-CREATE TABLE lab_orders (order_id TEXT PRIMARY KEY, patient_id TEXT, test TEXT, urgency TEXT);
-CREATE TABLE pages      (page_id TEXT PRIMARY KEY, patient_id TEXT, clinician TEXT, urgency TEXT);
-CREATE TABLE prior_auths (auth_id TEXT PRIMARY KEY, patient_id TEXT, drug TEXT, status TEXT);
+CREATE TABLE IF NOT EXISTS stock      (drug TEXT PRIMARY KEY, units INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS lab_orders (order_id TEXT PRIMARY KEY, patient_id TEXT, test TEXT, urgency TEXT);
+CREATE TABLE IF NOT EXISTS pages      (page_id TEXT PRIMARY KEY, patient_id TEXT, clinician TEXT, urgency TEXT);
+CREATE TABLE IF NOT EXISTS prior_auths (auth_id TEXT PRIMARY KEY, patient_id TEXT, drug TEXT, status TEXT);
 """
 
 # patient -> (age, primary care, conditions, (K x10, INR x10, A1c x10, glucose),

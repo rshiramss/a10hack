@@ -9,7 +9,8 @@ Operator endpoints (session cookie + X-Ward header):
   POST /api/revoke {agent_id}      revoke any agent, any time
   POST /api/settings {...}         watchdog seconds, step pace, replace-revoked toggle
   POST /api/rogue                  a specialist tries to call another one
-  POST /api/reset                  fresh gateway, fresh agents, fresh audit log
+  POST /api/reset                  fresh gateway, fresh agents, fresh audit log (wipes MCP creds)
+  POST /api/clear-history          clear past runs/specialists/audit; keep MCP + master
   POST /api/mcp/issue {role}       provision an external MCP agent; secret shown once
 
 Agent / MCP:
@@ -20,6 +21,7 @@ Agent / MCP:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hmac
 import json
@@ -73,18 +75,62 @@ def default_llm(config: WardConfig) -> tuple[Any, str, str]:
     return client, model, check_llm_ready() or ""
 
 
-class Console:
-    """Holds the live gateway + master. Reset swaps both for fresh ones."""
+WARD_DB = Path(__file__).resolve().parent.parent / "data" / "ward.db"
+WARD_KEY = Path(__file__).resolve().parent.parent / "data" / "ward.key"
 
-    def __init__(self, config: WardConfig, llm: Any, model: str, sleep=time.sleep) -> None:  # noqa: ANN001
+
+def _load_or_create_master_key(path: Path) -> bytes:
+    if path.is_file():
+        raw = path.read_bytes()
+        if len(raw) == 32:
+            return raw
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = secrets.token_bytes(32)
+    path.write_bytes(raw)
+    path.chmod(0o600)
+    return raw
+
+
+class Console:
+    """Holds the live gateway + master. Reset swaps both for fresh ones.
+
+    With persist=True (live `scripts.ward`), gateway state + HMAC master key live under
+    data/ so a process restart does not orphan MCP credentials. Explicit Reset still wipes.
+    """
+
+    def __init__(
+        self,
+        config: WardConfig,
+        llm: Any,
+        model: str,
+        sleep=time.sleep,  # noqa: ANN001
+        persist: bool = False,
+    ) -> None:
         self.config = config
         self.llm = llm
         self.model = model
         self._sleep = sleep
-        self.reset()
+        self.persist = persist
+        self.reset(wipe=False)
 
-    def reset(self) -> None:
-        self.gateway = Gateway(self.config, sleep=self._sleep)
+    def reset(self, wipe: bool = True) -> None:
+        if self.persist and wipe:
+            for path in (WARD_DB, WARD_KEY):
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+            for side in (f"{WARD_DB}-wal", f"{WARD_DB}-shm"):
+                with contextlib.suppress(FileNotFoundError):
+                    Path(side).unlink()
+        if self.persist:
+            master_key = _load_or_create_master_key(WARD_KEY)
+            self.gateway = Gateway(
+                self.config,
+                db_path=str(WARD_DB),
+                sleep=self._sleep,
+                master_key=master_key,
+            )
+        else:
+            self.gateway = Gateway(self.config, sleep=self._sleep)
         self.master = MasterAgent(self.gateway, self.llm, self.model, sleep=self._sleep)
         self.master.ensure_identity()
         self.thread: threading.Thread | None = None
@@ -136,6 +182,7 @@ def create_app(
     operators: dict[str, str] | None = None,
     watchdog: bool = True,
     sleep=time.sleep,  # noqa: ANN001
+    persist: bool = False,
 ) -> FastAPI:
     config = config or load_config()
     raw_demo = yaml.safe_load(DEFAULT_PATH.read_text()).get("demo", {})
@@ -146,11 +193,50 @@ def create_app(
     llm_problem = ""
     if llm is None:
         llm, model, llm_problem = default_llm(config)
-    console = Console(config, llm, model or "fake", sleep=sleep)
+    console = Console(config, llm, model or "fake", sleep=sleep, persist=persist)
     sessions: dict[str, str] = {}
 
     app = FastAPI(title="Ward console", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.console = console
+
+    def _mcp_ask(prompt: str) -> dict[str, Any]:
+        """MCP ask_ward → same OrchestratorAgent path as the console chat.
+
+        Runs the master on a worker thread (and /mcp itself is off the event loop) so
+        /api/state keeps polling — the dashboard can show live leases and Revoke mid-run.
+        """
+        c = app.state.console
+        if c.busy:
+            raise Denied("DENY_BUSY", "orchestrator is busy with another request")
+        c.gateway.close_mcp_sessions("superseded by ask_ward")
+        box: dict[str, Any] = {}
+        err: list[BaseException] = []
+
+        def work() -> None:
+            try:
+                box["run_id"] = c.master.handle(prompt)
+            except BaseException as exc:  # noqa: BLE001 - surface to MCP caller
+                err.append(exc)
+
+        c.thread = threading.Thread(target=work, daemon=True)
+        c.thread.start()
+        c.thread.join()
+        if err:
+            raise err[0]
+        run_id = str(box.get("run_id", ""))
+        row = c.gateway.conn.execute(
+            "SELECT status, answer, error FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return {
+            "run_id": run_id,
+            "status": row["status"] if row else "unknown",
+            "answer": (row["answer"] if row else None) or "",
+            "error": (row["error"] if row else None) or "",
+        }
+
+    app.state.console.gateway.set_mcp_ask_handler(_mcp_ask)
+    # Drop pre-fixover MCP session runs that held specialists open forever.
+    app.state.console.gateway.close_mcp_sessions("mcp front door is ask_ward only")
 
     if watchdog:
 
@@ -309,6 +395,28 @@ def create_app(
             {"ok": True, "results": app.state.console.gateway.tampered_agent_test()}
         )
 
+    @app.post("/api/clear-history")
+    def clear_history(request: Request) -> JSONResponse:
+        """Clear runs, specialists, and the audit feed.
+
+        Keeps the current master, active MCP identities, and data/mcp-credentials.env.
+        Aborts an in-flight run if needed (no longer returns BUSY).
+        """
+        if (bad := guarded(request)) is not None:
+            return bad
+        c = app.state.console
+        keep = {c.master.agent_id} if c.master.agent_id else set()
+        for row in c.gateway.conn.execute(
+            "SELECT agent_id, role, status FROM agents WHERE status = 'active'"
+        ):
+            if c.gateway.config.roles[row["role"]].external:
+                keep.add(row["agent_id"])
+        stats = c.gateway.clear_history(keep_agent_ids=keep)
+        # Let a just-aborted ask_ward/chat worker exit so busy clears.
+        if c.thread is not None and c.thread.is_alive():
+            c.thread.join(timeout=3)
+        return JSONResponse({"ok": True, **stats})
+
     @app.post("/api/reset")
     def reset(request: Request) -> JSONResponse:
         if (bad := guarded(request)) is not None:
@@ -360,12 +468,21 @@ def create_app(
         if role not in {r.name for r in app.state.console.gateway.config.external_roles()}:
             return JSONResponse({"ok": False, "reason": "UNKNOWN_ROLE"}, status_code=400)
         agent_id, secret = app.state.console.gateway.provision(role)
+        # Operator-issued secret file for badge_agent (gitignored). Cursor never mints this.
+        cred_dir = Path(__file__).resolve().parent.parent / "data"
+        cred_dir.mkdir(parents=True, exist_ok=True)
+        cred_path = cred_dir / "mcp-credentials.env"
+        cred_path.write_text(
+            f"WARD_CLIENT_ID={agent_id}\nWARD_CLIENT_SECRET={secret}\nWARD_ROLE={role}\n",
+            encoding="utf-8",
+        )
+        cred_path.chmod(0o600)
         app.state.console.gateway._audit(  # noqa: SLF001
             "MCP_CREDENTIAL_ISSUED",
             f"Operator {operator(request)} issued MCP credentials for {agent_id} ({role})",
             actor=f"operator:{operator(request)}",
             target=agent_id,
-            detail={"role": role, "secret": "shown once to operator"},
+            detail={"role": role, "secret": "written once to data/mcp-credentials.env"},
         )
         return JSONResponse(
             {
@@ -373,7 +490,11 @@ def create_app(
                 "client_id": agent_id,
                 "secret": secret,
                 "role": role,
-                "warning": "Copy the secret now. It is not shown again.",
+                "credentials_file": str(cred_path),
+                "warning": (
+                    "Operator-issued secret written to data/mcp-credentials.env (gitignored). "
+                    "Point Cursor mcp.json at that file — do not let an agent invent credentials."
+                ),
             }
         )
 
@@ -467,7 +588,10 @@ def create_app(
                 )
             except Denied as exc:
                 denied = exc
-        reply = handle_message(message, app.state.console.gateway, badge, denied)
+        # Off the event loop: ask_ward can take many seconds; UI must keep polling.
+        reply = await asyncio.to_thread(
+            handle_message, message, app.state.console.gateway, badge, denied
+        )
         if reply.body is None:
             return Response(status_code=202)
         return JSONResponse(reply.body, status_code=reply.status)

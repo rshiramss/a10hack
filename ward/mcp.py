@@ -5,7 +5,10 @@ Streamable HTTP, JSON responses only. Auth is badge + proof-of-possession:
   Authorization: Bearer <badge>
   X-Badge-Proof: <proof JWT>   op = mcp:<method>  (and :tool for tools/call)
 
-tools/call runs the same lease → delegation → sealed handshake → typed output path.
+External clients never see specialist tools. The only tool is `ask_ward`, which hands
+the prompt to OrchestratorAgent. That master declares plans; the gateway mints leases,
+spawns badged specialists, and runs sealed consults. Cursor cannot call get_allergies
+(or any specialist tool) even if it tries — that is DENY_ROLE_FORBIDDEN + revoke.
 """
 
 from __future__ import annotations
@@ -14,12 +17,37 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from ward.config import FieldSpec, WardConfig
 from ward.gateway import Badge, Denied, Gateway
 
 SUPPORTED_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 SERVER_INFO = {"name": "ward-gateway", "version": "0.1.0"}
 GATEWAY_META_KEY = "dev.ward/decision"
+
+ASK_WARD = "ask_ward"
+
+ASK_WARD_TOOL: dict[str, Any] = {
+    "name": ASK_WARD,
+    "description": (
+        "Send a natural-language hospital request to the Ward gateway. "
+        "OrchestratorAgent plans which specialists to consult; every consult goes through "
+        "lease → delegation → sealed handshake → typed output. "
+        "You cannot call specialist tools (get_allergies, check_coverage, …) yourself."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000,
+                "description": "What to ask the ward (patient id/name, drug, coverage, order, …).",
+            }
+        },
+        "required": ["prompt"],
+        "additionalProperties": False,
+    },
+    "annotations": {"readOnlyHint": False},
+}
 
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -43,60 +71,6 @@ def _error(msg_id: Any, code: int, message: str, data: Any = None) -> McpReply:
     if data is not None:
         error["data"] = data
     return McpReply(200, {"jsonrpc": "2.0", "id": msg_id, "error": error})
-
-
-def field_json_schema(spec: FieldSpec) -> dict[str, Any]:
-    if spec.type == "bool":
-        return {"type": "boolean"}
-    if spec.type == "int":
-        schema: dict[str, Any] = {"type": "integer"}
-        if spec.min is not None:
-            schema["minimum"] = spec.min
-        if spec.max is not None:
-            schema["maximum"] = spec.max
-        return schema
-    if spec.type == "enum":
-        return {"type": "string", "enum": list(spec.values)}
-    if spec.type == "id":
-        return {"type": "string", "pattern": spec.pattern}
-    if spec.type == "list" and spec.items:
-        return {
-            "type": "array",
-            "items": field_json_schema(spec.items),
-            "maxItems": spec.max_items,
-        }
-    return {"type": "string"}
-
-
-def tool_input_schema(config: WardConfig, tool_name: str) -> dict[str, Any]:
-    tool = config.tools[tool_name]
-    properties = {name: field_json_schema(spec) for name, spec in tool.args.items()}
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": list(tool.args),
-        "additionalProperties": False,
-    }
-
-
-def to_mcp_tools(config: WardConfig, caps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out = []
-    for cap in caps:
-        name = cap["tool"]
-        tool = config.tools[name]
-        needs = cap.get("needs_earlier_steps") or []
-        desc = tool.description
-        if needs:
-            desc += f" Requires earlier calls in this session: {', '.join(needs)}."
-        out.append(
-            {
-                "name": name,
-                "description": desc,
-                "inputSchema": tool_input_schema(config, name),
-                "annotations": {"readOnlyHint": not tool.mutating},
-            }
-        )
-    return out
 
 
 def _tool_result(ok: bool, payload: dict[str, Any], reason: str = "") -> dict[str, Any]:
@@ -149,7 +123,7 @@ def handle_message(
         requested = params.get("protocolVersion")
         version = requested if requested in SUPPORTED_VERSIONS else SUPPORTED_VERSIONS[-1]
         try:
-            gateway.ensure_mcp_run_as(badge)
+            gateway.mcp_touch(badge)
         except Denied as exc:
             return _error(
                 msg_id, ACCESS_DENIED, exc.reason, {"reason": exc.reason, "detail": exc.detail}
@@ -161,18 +135,17 @@ def handle_message(
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": SERVER_INFO,
                 "instructions": (
-                    "Ward hospital gateway. Only the tools listed for your role are visible. "
-                    "Call prerequisites before tools that need earlier typed results. "
-                    "Off-role calls are denied and revoke your identity."
+                    "Ward hospital gateway. Your only tool is ask_ward. "
+                    "Pass the user's request as prompt; OrchestratorAgent consults specialists "
+                    "through the gateway. Do not invent or call specialist tool names."
                 ),
             },
         )
 
     if method == "tools/list":
         try:
-            gateway.ensure_mcp_run_as(badge)
-            caps = gateway.mcp_list_tools_as(badge)
-            return _result(msg_id, {"tools": to_mcp_tools(gateway.config, caps)})
+            gateway.mcp_touch(badge)
+            return _result(msg_id, {"tools": gateway.mcp_list_tools_as(badge)})
         except Denied as exc:
             return _error(
                 msg_id, ACCESS_DENIED, exc.reason, {"reason": exc.reason, "detail": exc.detail}
@@ -189,7 +162,6 @@ def handle_message(
             return _result(msg_id, _tool_result(True, result if isinstance(result, dict) else {}))
         except Denied as exc:
             payload = {"reason": exc.reason, "detail": exc.detail}
-            # Prefer MCP tool-result errors for call denials (audited already by gateway).
             return _result(msg_id, _tool_result(False, payload, reason=exc.reason))
 
     return _error(msg_id, METHOD_NOT_FOUND, f"method {method} not supported")

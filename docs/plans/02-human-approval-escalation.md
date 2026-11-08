@@ -1,5 +1,7 @@
 # Feature 2: Human approval + escalation
 
+> **Historical plan** (pre-implementation notes). Implemented in `ward/gateway.py` + console UI.
+
 ## Goal
 
 Tools that need a clinician/operator sign-off pause at `awaiting_approval` until Approve,

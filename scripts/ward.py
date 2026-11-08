@@ -27,8 +27,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
-    app = create_app()
+    app = create_app(persist=True)
     llm = app.state.console.model
+    # DEMO_HARDCODE: print the shared demo operator passwords for local hackathon use.
     print(f"\n  Badge · Ward console  →  http://{args.host}:{args.port}/")
     print(
         "  Operator logins: alice / ward-demo-Qx7m, bob / ward-demo-Kp3v"

@@ -363,13 +363,64 @@ def revoke_during_sleep(gw: Gateway, pick) -> None:  # noqa: ANN001
 
 def test_revoked_specialist_is_replaced_by_a_fresh_instance(master) -> None:  # noqa: ANN001
     gw, token = master
+    gw.settings["replace_revoked_specialists"] = True
     run_id = gw.start_run(token("start_run"), "t")
     plan = gw.declare_plan(
         token("declare_plan"), run_id, rx_plan("P001", "acetaminophen", 1000)[:1]
     )
-    revoke_during_sleep(gw, lambda: "MedHistoryAgent1")
+    # Replacement only applies when the lease was NOT cancelled by revoke(); simulate
+    # an in-flight agent death without cancelling the lease (badge-only revoke path).
+    fired: list[bool] = []
+
+    def sleep(_: float) -> None:
+        if not fired:
+            fired.append(True)
+            # Mark agent revoked but leave lease active (old soft-fail path).
+            gw.conn.execute(
+                "UPDATE agents SET status = 'revoked', ended_ms = ?, end_reason = ?"
+                " WHERE agent_id = ?",
+                (int(time.time() * 1000), "mid-call", "MedHistoryAgent1"),
+            )
+            gw.conn.execute(
+                "UPDATE badges SET revoked_ms = ? WHERE agent_id = ? AND revoked_ms IS NULL",
+                (int(time.time() * 1000), "MedHistoryAgent1"),
+            )
+
+    gw._sleep = sleep  # noqa: SLF001
     out = gw.consult(token("consult"), plan["leases"][0]["lease_id"])
     assert out["agent"] == "MedHistoryAgent2"
+
+
+def test_operator_revoke_stops_rest_of_plan(master) -> None:  # noqa: ANN001
+    """Revoke a specialist: current + later leases die; earlier typed results remain."""
+    gw, token = master
+    gw.settings["replace_revoked_specialists"] = False
+    run_id = gw.start_run(token("start_run"), "t")
+    steps = [
+        {"agent": "MedHistoryAgent", "tool": "get_allergies", "args": {"patient_id": "P001"}},
+        {
+            "agent": "MedHistoryAgent",
+            "tool": "get_active_medications",
+            "args": {"patient_id": "P001"},
+        },
+        {"agent": "InsuranceAgent", "tool": "check_coverage",
+         "args": {"patient_id": "P001", "drug": "lisinopril"}},
+    ]
+    plan = gw.declare_plan(token("declare_plan"), run_id, steps)
+    # Complete first lease normally.
+    first = gw.consult(token("consult"), plan["leases"][0]["lease_id"])
+    assert "allergies" in first["result"]
+    # Revoke mid second consult — cancels remaining leases.
+    revoke_during_sleep(gw, lambda: "MedHistoryAgent1")
+    with pytest.raises(Denied) as exc:
+        gw.consult(token("consult"), plan["leases"][1]["lease_id"])
+    assert exc.value.reason == "DENY_REVOKED"
+    third = gw.conn.execute(
+        "SELECT status FROM leases WHERE lease_id = ?", (plan["leases"][2]["lease_id"],)
+    ).fetchone()
+    assert third["status"] == "revoked"
+    used = gw.used_results(run_id)
+    assert len(used) == 1 and used[0]["tool"] == "get_allergies"
 
 
 def test_revoked_specialist_fails_the_step_without_replacement(master) -> None:  # noqa: ANN001

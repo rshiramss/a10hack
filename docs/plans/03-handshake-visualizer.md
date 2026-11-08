@@ -1,5 +1,7 @@
 # Feature 3: Handshake visualizer
 
+> **Historical plan** (pre-implementation notes). Live UI: `server/ward_ui/handshake.js`.
+
 ## Goal
 
 For the selected plan step, an animated sequence diagram (Orchestrator / external agent |

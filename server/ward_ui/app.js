@@ -232,7 +232,8 @@ function resultChips(step) {
 }
 
 function renderRun(snap) {
-  const run = snap.runs[0];
+  // Prefer the in-flight run so leases/Revoke stay visible during ask_ward / chat.
+  const run = snap.runs.find((r) => r.status === "running") || snap.runs[0];
   const steps = $("steps");
   const watchdog = $("watchdog");
   if (!run) { steps.replaceChildren(); $("run-empty").hidden = false; watchdog.hidden = true; $("run-meta").textContent = ""; return; }
@@ -418,7 +419,8 @@ async function send(event) {
   const r = await post("/api/chat", { prompt, stuck: $("stuck").checked });
   if (r.ok) {
     $("prompt").value = ""; $("stuck").checked = false;
-    document.querySelector(".examples-wrap").open = false;
+    const examples = document.querySelector(".examples-wrap");
+    if (examples) examples.open = false;
   }
   else say(r.reason === "BUSY" ? "The master is still working on the last request." : r.reason, false);
 }
@@ -487,14 +489,36 @@ document.addEventListener("DOMContentLoaded", () => {
     const out = $("mcp-issue-out");
     out.hidden = false;
     out.textContent =
-      `client_id=${r.client_id}\nsecret=${r.secret}\nrole=${r.role}\n\n${r.warning}\n` +
-      `Set WARD_URL, WARD_CLIENT_ID, WARD_CLIENT_SECRET for scripts/badge_agent.py`;
-    say(`Issued ${r.client_id} — copy the secret now`, true);
+      `client_id=${r.client_id}\nsecret=${r.secret}\nrole=${r.role}\n` +
+      `credentials_file=${r.credentials_file || "data/mcp-credentials.env"}\n\n` +
+      `${r.warning}\n\n` +
+      `Cursor mcp.json can omit the secret and use:\n` +
+      `  WARD_CREDENTIALS_FILE → that path\n` +
+      `(badge_agent also auto-reads data/mcp-credentials.env)`;
+    say(`Issued ${r.client_id} — secret filed under data/ (gitignored)`, true);
+  });
+  $("clear-history").addEventListener("click", async () => {
+    const r = await post("/api/clear-history");
+    if (r.ok) {
+      state.audit = []; state.lastSeq = 0; state.open.clear(); state.selectedLease = null;
+      const aborted = r.aborted_runs ? ` (aborted ${r.aborted_runs} in-flight)` : "";
+      say(
+        `History cleared — kept MCP/master, removed ${r.removed_runs || 0} run(s) and ${r.removed_agents || 0} agent(s)${aborted}.`,
+        true,
+      );
+    } else {
+      say(r.detail || r.reason || "clear failed", false);
+    }
   });
   $("reset").addEventListener("click", async () => {
     const r = await post("/api/reset");
     state.examplesShown = false; state.settingsShown = false; state.mcpRolesShown = false;
-    say(r.ok ? "Fresh gateway, fresh agents, fresh audit log." : r.reason, r.ok);
+    say(
+      r.ok
+        ? "Full reset — MCP credentials wiped; re-Issue MCP credential before using Cursor again."
+        : r.reason,
+      r.ok,
+    );
   });
   document.querySelectorAll(".seg-btn").forEach((b) => b.addEventListener("click", () => {
     document.querySelectorAll(".seg-btn").forEach((x) => x.classList.toggle("on", x === b));

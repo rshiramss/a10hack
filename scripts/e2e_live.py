@@ -435,18 +435,18 @@ def scenarios() -> list[Scenario]:
         ),
         Scenario(
             "mcp_authorized",
-            "MCP clinician_assistant get_allergies",
+            "MCP ask_ward → orchestrator get_allergies",
             None,
-            custom=lambda gw, m: _mcp_authorized(gw),
+            custom=lambda gw, m: _mcp_authorized(gw, m),
             security=[
-                ("MCP get_allergies returned typed allergies", lambda o: o.extra.get("ok", False)),
+                ("ask_ward returned an answer via orchestrator", lambda o: o.extra.get("ok", False)),
                 chain_ok(),
             ],
             quality=[],
         ),
         Scenario(
             "mcp_overreach",
-            "MCP scheduling_assistant overreach on draft_order",
+            "MCP client cannot call specialist tools directly",
             None,
             custom=lambda gw, m: _mcp_overreach(gw),
             security=[
@@ -458,11 +458,11 @@ def scenarios() -> list[Scenario]:
         ),
         Scenario(
             "mcp_revoke_mid",
-            "MCP revoke mid-session blocks next call",
+            "MCP revoke mid-session blocks next ask_ward",
             None,
-            custom=lambda gw, m: _mcp_revoke_mid(gw),
+            custom=lambda gw, m: _mcp_revoke_mid(gw, m),
             security=[
-                ("first call ok", lambda o: o.extra.get("first_ok")),
+                ("first ask ok", lambda o: o.extra.get("first_ok")),
                 ("second call DENY_REVOKED", lambda o: o.extra.get("second_revoked")),
                 chain_ok(),
             ],
@@ -530,6 +530,7 @@ def _mcp_login(gw: Gateway, role: str = "clinician_assistant"):
     from ward import crypto
     from ward.attestation import badge_agent_path, measure_source_file
     from ward.gateway import Credential
+    from ward.mcp import ASK_WARD
 
     aid, secret = gw.provision(role)
     key = crypto.AgentKey()
@@ -547,22 +548,37 @@ def _mcp_login(gw: Gateway, role: str = "clinician_assistant"):
         badge = gw.verify(Credential(token, key.proof(token, op)), op)
         return gw.mcp_call_tool_as(badge, tool, args)
 
-    return aid, token, key, call
+    def ask(prompt: str) -> dict[str, Any]:
+        return call(ASK_WARD, {"prompt": prompt})
+
+    return aid, token, key, call, ask
 
 
-def _mcp_authorized(gw: Gateway) -> dict[str, Any]:
-    _aid, _token, _key, call = _mcp_login(gw)
-    out = call("get_allergies", {"patient_id": "P001"})
-    return {"ok": isinstance(out.get("result"), dict) and "allergies" in out["result"]}
+def _mcp_authorized(gw: Gateway, master: MasterAgent) -> dict[str, Any]:
+    gw.set_mcp_ask_handler(
+        lambda prompt: {
+            "run_id": master.handle(prompt),
+            "status": "done",
+            "answer": gw.conn.execute(
+                "SELECT answer FROM runs ORDER BY created_ms DESC LIMIT 1"
+            ).fetchone()["answer"]
+            or "",
+            "error": "",
+        }
+    )
+    _aid, _token, _key, _call, ask = _mcp_login(gw)
+    out = ask("What allergies does patient P001 have?")
+    answer = (out.get("result") or {}).get("answer") or ""
+    return {"ok": bool(answer) and out["result"].get("status") == "done"}
 
 
 def _mcp_overreach(gw: Gateway) -> dict[str, Any]:
     from ward.gateway import Denied
 
-    aid, _token, _key, call = _mcp_login(gw, "scheduling_assistant")
+    aid, _token, _key, call, _ask = _mcp_login(gw, "scheduling_assistant")
     denied = False
     try:
-        call("draft_order", {"patient_id": "P001", "drug": "amoxicillin", "daily_dose_mg": 500})
+        call("get_allergies", {"patient_id": "P001"})
     except Denied as exc:
         denied = exc.reason == "DENY_ROLE_FORBIDDEN"
     status = gw.conn.execute(
@@ -571,22 +587,34 @@ def _mcp_overreach(gw: Gateway) -> dict[str, Any]:
     return {"denied": denied, "revoked": status == "revoked"}
 
 
-def _mcp_revoke_mid(gw: Gateway) -> dict[str, Any]:
+def _mcp_revoke_mid(gw: Gateway, master: MasterAgent) -> dict[str, Any]:
     from ward.gateway import Denied
 
-    aid, token, key, call = _mcp_login(gw)
-    first = call("get_allergies", {"patient_id": "P001"})
+    gw.set_mcp_ask_handler(
+        lambda prompt: {
+            "run_id": master.handle(prompt),
+            "status": "done",
+            "answer": gw.conn.execute(
+                "SELECT answer FROM runs ORDER BY created_ms DESC LIMIT 1"
+            ).fetchone()["answer"]
+            or "",
+            "error": "",
+        }
+    )
+    aid, token, key, _call, ask = _mcp_login(gw)
+    first = ask("What allergies does patient P001 have?")
     gw.revoke(aid, "operator:e2e", "mid-session")
     second_revoked = False
     try:
         from ward.gateway import Credential
+        from ward.mcp import ASK_WARD
 
-        op = "mcp:tools/call:get_allergies"
+        op = f"mcp:tools/call:{ASK_WARD}"
         gw.verify(Credential(token, key.proof(token, op)), op)
     except Denied as exc:
         second_revoked = exc.reason == "DENY_REVOKED"
     return {
-        "first_ok": "allergies" in first.get("result", {}),
+        "first_ok": bool((first.get("result") or {}).get("answer")),
         "second_revoked": second_revoked,
     }
 

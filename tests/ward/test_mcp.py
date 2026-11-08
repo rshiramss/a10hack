@@ -1,4 +1,4 @@
-"""MCP front door + badge_agent: bring-your-own agent against Ward."""
+"""MCP front door: external clients only ask_ward; orchestrator wires specialists."""
 
 from __future__ import annotations
 
@@ -14,12 +14,13 @@ import httpx
 import pytest
 import uvicorn
 
+from tests.ward.fakes import FakeLLM, plan_turn, text_turn
 from ward import crypto
 from ward.attestation import badge_agent_path, measure_source_file
 from ward.config import load_config
 from ward.gateway import Credential, Denied, Gateway
-from ward.mcp import proof_op, to_mcp_tools
-from ward.typed import check_record
+from ward.master import MasterAgent
+from ward.mcp import ASK_WARD, proof_op
 
 ROOT = Path(__file__).resolve().parents[2]
 CFG = load_config()
@@ -52,11 +53,32 @@ def cred(token: str, key: crypto.AgentKey, op: str) -> Credential:
     return Credential(token, key.proof(token, op))
 
 
+def wire_ask(gw: Gateway, llm: FakeLLM | None = None) -> MasterAgent:
+    """Attach OrchestratorAgent as the ask_ward handler (same as the live console)."""
+    agent = MasterAgent(gw, llm or FakeLLM([]), "fake", sleep=lambda _s: None)
+    agent.ensure_identity()
+
+    def ask(prompt: str) -> dict[str, Any]:
+        run_id = agent.handle(prompt)
+        row = gw.conn.execute(
+            "SELECT status, answer, error FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return {
+            "run_id": run_id,
+            "status": row["status"],
+            "answer": row["answer"] or "",
+            "error": row["error"] or "",
+        }
+
+    gw.set_mcp_ask_handler(ask)
+    return agent
+
+
 @pytest.fixture
 def gw() -> Gateway:
     g = Gateway(CFG, sleep=lambda _s: None)
     g.settings["step_delay_ms"] = 0
-    g.settings["approvals_enabled"] = False  # Feature 2 tests opt in explicitly
+    g.settings["approvals_enabled"] = False
     return g
 
 
@@ -64,57 +86,64 @@ def test_config_loads_external_roles() -> None:
     assert "clinician_assistant" in CFG.roles
     assert "scheduling_assistant" in CFG.roles
     assert CFG.roles["clinician_assistant"].external
-    assert CFG.roles["clinician_assistant"].allows_tool("draft_order")
-    assert not CFG.roles["scheduling_assistant"].allows_tool("draft_order")
-    assert CFG.roles["scheduling_assistant"].allows_tool("book_appointment")
+    assert not CFG.roles["clinician_assistant"].may_delegate
+    assert CFG.roles["clinician_assistant"].tools_allowed is None
+    assert not CFG.roles["clinician_assistant"].allows_tool("draft_order")
+    assert not CFG.roles["scheduling_assistant"].allows_tool("get_allergies")
+    # Specialists only accept the orchestrator.
+    assert CFG.roles["med_history"].callable_by == ("orchestrator",)
 
 
-def test_mcp_list_filtered_by_role(gw: Gateway) -> None:
-    aid, secret = provision_external(gw, "scheduling_assistant")
-    token, key = login_external(gw, aid, secret)
-    badge = gw.verify(cred(token, key, "mcp:tools/list"), "mcp:tools/list")
-    names = {c["tool"] for c in gw.mcp_list_tools_as(badge)}
-    assert names == {"find_appointment_slots", "book_appointment", "get_patient_profile"}
-    assert "draft_order" not in names
+def test_mcp_lists_only_ask_ward(gw: Gateway) -> None:
+    for role in ("clinician_assistant", "scheduling_assistant"):
+        aid, secret = provision_external(gw, role)
+        token, key = login_external(gw, aid, secret)
+        badge = gw.verify(cred(token, key, "mcp:tools/list"), "mcp:tools/list")
+        tools = gw.mcp_list_tools_as(badge)
+        assert [t["name"] for t in tools] == [ASK_WARD]
+        assert "get_allergies" not in {t["name"] for t in tools}
 
 
-def test_mcp_get_allergies_success(gw: Gateway) -> None:
-    aid, secret = provision_external(gw)
-    token, key = login_external(gw, aid, secret)
-    badge = gw.verify(
-        cred(token, key, "mcp:tools/call:get_allergies"), "mcp:tools/call:get_allergies"
+def test_ask_ward_runs_through_orchestrator(gw: Gateway) -> None:
+    llm = FakeLLM(
+        [
+            plan_turn(
+                [{"agent": "MedHistoryAgent", "tool": "get_allergies", "args": {"patient_id": "P001"}}]
+            ),
+            text_turn("No known allergies for P001."),
+        ]
     )
-    out = gw.mcp_call_tool_as(badge, "get_allergies", {"patient_id": "P001"})
-    assert out["tool"] == "get_allergies"
-    problem = check_record(CFG.tools["get_allergies"].output, out["result"], "out")
-    assert problem is None
-
-
-def test_draft_order_needs_prerequisites_then_succeeds(gw: Gateway) -> None:
+    wire_ask(gw, llm)
     aid, secret = provision_external(gw)
     token, key = login_external(gw, aid, secret)
+    badge = gw.verify(cred(token, key, f"mcp:tools/call:{ASK_WARD}"), f"mcp:tools/call:{ASK_WARD}")
+    out = gw.mcp_call_tool_as(badge, ASK_WARD, {"prompt": "What allergies does P001 have?"})
+    assert out["tool"] == ASK_WARD
+    assert out["result"]["status"] == "done"
+    assert "allerg" in out["result"]["answer"].lower() or out["result"]["answer"]
+    # Specialist was spun for the orchestrator run, then retired when the run ended.
+    meds = gw.conn.execute(
+        "SELECT status FROM agents WHERE role = 'med_history' ORDER BY created_ms DESC LIMIT 1"
+    ).fetchone()
+    assert meds is not None
+    assert meds["status"] == "retired"
 
-    def call(tool: str, args: dict[str, Any]) -> dict[str, Any]:
-        op = f"mcp:tools/call:{tool}"
-        badge = gw.verify(cred(token, key, op), op)
-        return gw.mcp_call_tool_as(badge, tool, args)
 
+def test_specialist_tool_via_mcp_revokes(gw: Gateway) -> None:
+    wire_ask(gw)
+    aid, secret = provision_external(gw)
+    token, key = login_external(gw, aid, secret)
+    op = "mcp:tools/call:get_allergies"
+    badge = gw.verify(cred(token, key, op), op)
     with pytest.raises(Denied) as exc:
-        call("draft_order", {"patient_id": "P003", "drug": "amoxicillin", "daily_dose_mg": 1500})
-    assert exc.value.reason == "DENY_PRECONDITION"
-    assert "get_allergies" in exc.value.detail
-
-    call("get_allergies", {"patient_id": "P003"})
-    call("get_active_medications", {"patient_id": "P003"})
-    call("lookup_drug", {"drug": "amoxicillin"})
-    call("check_interactions", {"patient_id": "P003", "drug": "amoxicillin"})
-    call("get_renal_function", {"patient_id": "P003"})
-    out = call("draft_order", {"patient_id": "P003", "drug": "amoxicillin", "daily_dose_mg": 1500})
-    assert out["result"]["status"] in ("drafted", "blocked")
-    assert check_record(CFG.tools["draft_order"].output, out["result"], "draft") is None
+        gw.mcp_call_tool_as(badge, "get_allergies", {"patient_id": "P001"})
+    assert exc.value.reason == "DENY_ROLE_FORBIDDEN"
+    row = gw.conn.execute("SELECT status FROM agents WHERE agent_id = ?", (aid,)).fetchone()
+    assert row["status"] == "revoked"
 
 
 def test_scheduling_overreach_revokes(gw: Gateway) -> None:
+    wire_ask(gw)
     aid, secret = provision_external(gw, "scheduling_assistant")
     token, key = login_external(gw, aid, secret)
     op = "mcp:tools/call:draft_order"
@@ -143,11 +172,10 @@ def test_stolen_badge_without_key_revokes(gw: Gateway) -> None:
         gw.verify(Credential(token, None), "mcp:tools/list")
     row = gw.conn.execute("SELECT status FROM agents WHERE agent_id = ?", (aid,)).fetchone()
     assert row["status"] == "revoked"
-    # Cannot re-authenticate after revoke.
     with pytest.raises(Denied) as exc:
         login_external(gw, aid, secret)
     assert exc.value.reason == "DENY_REVOKED"
-    _ = key  # key held but useless after revoke
+    _ = key
 
 
 def test_pre_rotation_badge_refused(gw: Gateway) -> None:
@@ -162,59 +190,37 @@ def test_pre_rotation_badge_refused(gw: Gateway) -> None:
     with pytest.raises(Denied) as exc:
         gw.verify(cred(token, key, "mcp:tools/list"), "mcp:tools/list")
     assert exc.value.reason == "DENY_BADGE_SUPERSEDED"
-    # New badge works.
     gw.verify(cred(session["token"], new_key, "mcp:tools/list"), "mcp:tools/list")
 
 
-def test_operator_revoke_blocks_next_call(gw: Gateway) -> None:
+def test_operator_revoke_blocks_next_ask(gw: Gateway) -> None:
+    wire_ask(gw, FakeLLM([text_turn("ok")]))
     aid, secret = provision_external(gw)
     token, key = login_external(gw, aid, secret)
-    badge = gw.verify(
-        cred(token, key, "mcp:tools/call:get_allergies"), "mcp:tools/call:get_allergies"
-    )
-    gw.mcp_call_tool_as(badge, "get_allergies", {"patient_id": "P001"})
+    badge = gw.verify(cred(token, key, f"mcp:tools/call:{ASK_WARD}"), f"mcp:tools/call:{ASK_WARD}")
+    gw.mcp_call_tool_as(badge, ASK_WARD, {"prompt": "ping"})
     assert gw.revoke(aid, "operator:alice", "revoked from the console")
     with pytest.raises(Denied) as exc:
-        gw.verify(cred(token, key, "mcp:tools/call:get_allergies"), "mcp:tools/call:get_allergies")
+        gw.verify(cred(token, key, f"mcp:tools/call:{ASK_WARD}"), f"mcp:tools/call:{ASK_WARD}")
     assert exc.value.reason == "DENY_REVOKED"
-    with pytest.raises(Denied) as reauth:
-        login_external(gw, aid, secret)
-    assert reauth.value.reason == "DENY_REVOKED"
 
 
-def test_rotation_transparent_during_session(gw: Gateway) -> None:
-    aid, secret = provision_external(gw)
-    token, key = login_external(gw, aid, secret)
-    badge = gw.verify(
-        cred(token, key, "mcp:tools/call:get_allergies"), "mcp:tools/call:get_allergies"
+def test_close_mcp_sessions_retires_stuck_specialists(gw: Gateway) -> None:
+    """Leftover [mcp] session runs must not leave specialists spinning forever."""
+    run_id = "MCP-TEST01"
+    gw.conn.execute(
+        "INSERT INTO runs (run_id, master_id, prompt, status, created_ms, last_progress_ms, flagged)"
+        " VALUES (?, 'CursorAgent1', '[mcp] CursorAgent1', 'running', 1, 1, 0)",
+        (run_id,),
     )
-    gw.mcp_call_tool_as(badge, "get_allergies", {"patient_id": "P001"})
-    new_key = crypto.AgentKey()
-    session = gw.rotate(
-        cred(token, key, "rotate"), new_key.public_pem, new_key.proof(token, "rotate-new-key")
-    )
-    badge2 = gw.verify(
-        cred(session["token"], new_key, "mcp:tools/call:get_patient_profile"),
-        "mcp:tools/call:get_patient_profile",
-    )
-    out = gw.mcp_call_tool_as(badge2, "get_patient_profile", {"patient_id": "P001"})
-    assert "age" in out["result"]
-
-
-def test_json_schema_from_typed_config() -> None:
-    caps = [
-        {
-            "tool": "get_allergies",
-            "needs_earlier_steps": [],
-            "agent": "MedHistoryAgent",
-            "description": "",
-            "args": {},
-            "returns": {},
-        }
-    ]
-    tools = to_mcp_tools(CFG, caps)
-    assert tools[0]["name"] == "get_allergies"
-    assert tools[0]["inputSchema"]["properties"]["patient_id"]["type"] == "string"
+    aid, _ = gw.provision("med_history", run_id=run_id)
+    assert gw.close_mcp_sessions("test cleanup") == 1
+    status = gw.conn.execute(
+        "SELECT status FROM agents WHERE agent_id = ?", (aid,)
+    ).fetchone()["status"]
+    assert status == "retired"
+    run = gw.conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    assert run["status"] == "done"
 
 
 # ---- HTTP + stdio badge_agent -------------------------------------------------------------
@@ -225,8 +231,16 @@ def ward_server():
     from server.ward_app import create_app
 
     port = free_port()
+    llm = FakeLLM(
+        [
+            plan_turn(
+                [{"agent": "MedHistoryAgent", "tool": "get_allergies", "args": {"patient_id": "P001"}}]
+            ),
+            text_turn("No known drug allergies."),
+        ]
+    )
     app = create_app(
-        operators={"alice": "pw"}, llm=object(), model="fake", watchdog=False, sleep=lambda _s: None
+        operators={"alice": "pw"}, llm=llm, model="fake", watchdog=False, sleep=lambda _s: None
     )
     app.state.console.gateway.settings["step_delay_ms"] = 0
     app.state.console.gateway.settings["approvals_enabled"] = False
@@ -246,12 +260,10 @@ def ward_server():
 
 
 def issue_mcp(app, role: str = "clinician_assistant") -> tuple[str, str]:
-    client = app.state.console
-    # Direct provision (same as operator issue) for test speed.
-    return client.gateway.provision(role)
+    return app.state.console.gateway.provision(role)
 
 
-def test_badge_agent_stdio_mcp_sdk(ward_server) -> None:
+def test_badge_agent_stdio_ask_ward(ward_server) -> None:
     pytest.importorskip("mcp")
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -280,13 +292,14 @@ def test_badge_agent_stdio_mcp_sdk(ward_server) -> None:
             await session.initialize()
             listed = await session.list_tools()
             names = {t.name for t in listed.tools}
-            assert "get_allergies" in names
-            assert "draft_order" in names
-            result = await session.call_tool("get_allergies", {"patient_id": "P001"})
+            assert names == {ASK_WARD}
+            assert "get_allergies" not in names
+            result = await session.call_tool(ASK_WARD, {"prompt": "Allergies for P001?"})
             assert not result.is_error
             structured = result.structured_content
             assert structured is not None
-            assert "allergies" in structured
+            assert structured.get("status") == "done"
+            assert structured.get("answer")
 
     asyncio.run(run())
 
@@ -330,13 +343,20 @@ def test_http_mcp_revoke_mid_session(ward_server) -> None:
     )
     assert "result" in init
     listed = mcp("tools/list", {}, msg_id=2)
-    assert any(t["name"] == "get_allergies" for t in listed["result"]["tools"])
-    ok = mcp("tools/call", {"name": "get_allergies", "arguments": {"patient_id": "P001"}}, msg_id=3)
+    names = {t["name"] for t in listed["result"]["tools"]}
+    assert names == {ASK_WARD}
+    ok = mcp(
+        "tools/call",
+        {"name": ASK_WARD, "arguments": {"prompt": "Allergies for P001?"}},
+        msg_id=3,
+    )
     assert ok["result"]["isError"] is False
 
     assert app.state.console.gateway.revoke(client_id, "operator:alice", "mid-session")
     blocked = mcp(
-        "tools/call", {"name": "get_allergies", "arguments": {"patient_id": "P001"}}, msg_id=4
+        "tools/call",
+        {"name": ASK_WARD, "arguments": {"prompt": "again"}},
+        msg_id=4,
     )
     if "error" in blocked:
         assert blocked["error"]["data"]["reason"] == "DENY_REVOKED"

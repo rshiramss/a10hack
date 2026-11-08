@@ -80,6 +80,40 @@ def test_timeout_path(gw: Gateway) -> None:
     assert exc.value.reason == "DENY_APPROVAL_TIMEOUT"
 
 
+def test_watchdog_ignores_mcp_session_rows(gw: Gateway) -> None:
+    """[mcp] session rows are not watchdog targets; close_mcp_sessions retires them."""
+    gw.settings["watchdog_seconds"] = 0.05
+    gw.settings["approvals_enabled"] = False
+    aid, secret = gw.provision("clinician_assistant")
+    key = crypto.AgentKey()
+    gw.authenticate(
+        aid,
+        secret,
+        key.public_pem,
+        key.proof(secret, "authenticate"),
+        measure_source_file(badge_agent_path()),
+    )
+    run_id = "MCP-IDLE1"
+    gw.conn.execute(
+        "INSERT INTO runs (run_id, master_id, prompt, status, created_ms, last_progress_ms, flagged)"
+        " VALUES (?, ?, '[mcp] CursorAgent1', 'running', 1, 1, 0)",
+        (run_id, aid),
+    )
+    for _ in range(10):
+        gw.watchdog_tick()
+    assert (
+        gw.conn.execute("SELECT status FROM agents WHERE agent_id = ?", (aid,)).fetchone()[
+            "status"
+        ]
+        == "active"
+    )
+    assert gw.close_mcp_sessions() == 1
+    assert (
+        gw.conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()["status"]
+        == "done"
+    )
+
+
 def test_watchdog_paused_while_awaiting(gw: Gateway) -> None:
     gw.settings["watchdog_seconds"] = 0.05
     master = Caller(gw, CFG.master_role)
@@ -119,34 +153,16 @@ def test_watchdog_paused_while_awaiting(gw: Gateway) -> None:
     t.join(timeout=2)
 
 
-def test_mcp_waits_for_approval(gw: Gateway) -> None:
-    aid, secret = gw.provision("clinician_assistant")
-    key = crypto.AgentKey()
-    session = gw.authenticate(
-        aid,
-        secret,
-        key.public_pem,
-        key.proof(secret, "authenticate"),
-        measure_source_file(badge_agent_path()),
-    )
-    token = session["token"]
-
-    def call(tool: str, args: dict[str, Any]) -> dict[str, Any]:
-        op = f"mcp:tools/call:{tool}"
-        badge = gw.verify(Credential(token, key.proof(token, op)), op)
-        return gw.mcp_call_tool_as(badge, tool, args)
-
-    for tool, args in [
-        ("get_allergies", {"patient_id": "P003"}),
-        ("get_active_medications", {"patient_id": "P003"}),
-        ("lookup_drug", {"drug": "amoxicillin"}),
-        ("check_interactions", {"patient_id": "P003", "drug": "amoxicillin"}),
-        ("get_renal_function", {"patient_id": "P003"}),
-    ]:
-        call(tool, args)
-
+def test_orchestrator_waits_for_approval(gw: Gateway) -> None:
+    """Approvals still gate high-impact tools when the orchestrator (not MCP) consults."""
+    master = Caller(gw, CFG.master_role)
+    steps = rx_plan("P003", "amoxicillin", 1500)
+    run_id = gw.start_run(master("start_run"), "mcp-approval-via-orch")
+    plan = gw.declare_plan(master("declare_plan"), run_id, steps)
+    for lease in plan["leases"][:-1]:
+        gw.consult(master("consult"), lease["lease_id"])
     threading.Thread(target=_approve_when_pending, args=(gw,), daemon=True).start()
-    out = call("draft_order", {"patient_id": "P003", "drug": "amoxicillin", "daily_dose_mg": 1500})
+    out = gw.consult(master("consult"), plan["leases"][-1]["lease_id"])
     assert out["result"]["status"] in ("drafted", "blocked")
 
 
