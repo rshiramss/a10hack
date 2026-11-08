@@ -28,6 +28,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ward.env import load_dotenv
+
+load_dotenv()
+
 from agents.runner import check_llm_ready
 from ward.config import load_config
 from ward.data import INJECTION

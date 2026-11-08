@@ -15,6 +15,10 @@ import os
 
 import uvicorn
 
+from ward.env import load_dotenv
+
+load_dotenv()  # before the app reads GROQ_API_KEY / BADGE_* settings
+
 from server.ward_app import create_app
 
 
@@ -30,7 +34,9 @@ def main() -> None:
         "  Operator logins: alice / ward-demo-Qx7m, bob / ward-demo-Kp3v"
         " (override with WARD_OPERATORS)"
     )
-    print(f"  Master agent model: {llm}\n")
+    from agents.runner import llm_settings
+
+    print(f"  Master agent model: {llm} via {llm_settings()[0]}\n")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

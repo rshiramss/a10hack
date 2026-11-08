@@ -27,6 +27,8 @@ from badge import tool_schemas
 DEFAULT_MODEL = "claude-sonnet-5-5"  # anthropic backend
 DEFAULT_LOCAL_MODEL = "qwen2.5:3b"  # small, fast, solid at tool calls
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 MAX_TOKENS = 1024
 MAX_TURNS = 14
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
@@ -156,9 +158,15 @@ def run_llm_agent(
 
 def llm_settings() -> tuple[str, str, str, str]:
     """(provider, base_url, api_key, model) from the environment."""
-    provider = os.environ.get("BADGE_LLM_PROVIDER", "ollama").strip().lower()
+    # Groq is optional: setting GROQ_API_KEY switches to it unless a provider is named.
+    default = "groq" if os.environ.get("GROQ_API_KEY") else "ollama"
+    provider = (os.environ.get("BADGE_LLM_PROVIDER") or default).strip().lower()
     if provider == "anthropic":
         return provider, "", "", os.environ.get("BADGE_MODEL") or DEFAULT_MODEL
+    if provider == "groq":
+        key = os.environ.get("GROQ_API_KEY") or os.environ.get("BADGE_LLM_API_KEY") or ""
+        model = os.environ.get("BADGE_MODEL") or DEFAULT_GROQ_MODEL
+        return provider, os.environ.get("BADGE_LLM_BASE_URL") or GROQ_BASE_URL, key, model
     base_url = os.environ.get("BADGE_LLM_BASE_URL") or OLLAMA_BASE_URL
     api_key = os.environ.get("BADGE_LLM_API_KEY") or "ollama"  # Ollama ignores the key
     model = os.environ.get("BADGE_MODEL") or DEFAULT_LOCAL_MODEL
@@ -254,8 +262,10 @@ def check_llm_ready() -> str | None:
     provider, base_url, api_key, model = llm_settings()
     if provider == "anthropic":
         return None if os.environ.get("ANTHROPIC_API_KEY") else "set ANTHROPIC_API_KEY"
-    if provider not in ("ollama", "openai"):
-        return f"unknown BADGE_LLM_PROVIDER {provider!r} (use ollama, openai, or anthropic)"
+    if provider not in ("ollama", "openai", "groq"):
+        return f"unknown BADGE_LLM_PROVIDER {provider!r} (use ollama, groq, openai, or anthropic)"
+    if provider == "groq":
+        return None if api_key else "set GROQ_API_KEY"
     if provider == "openai":
         return None if os.environ.get("BADGE_LLM_API_KEY") else "set BADGE_LLM_API_KEY"
     import httpx
