@@ -250,6 +250,36 @@ function renderLog() {
 
 // ---- chat ------------------------------------------------------------------------------
 
+// Minimal, safe markdown for model answers: **bold**, `code`, and "- " bullets. Builds DOM
+// nodes from text (never innerHTML), so nothing in an answer can become markup.
+function inline(text) {
+  const nodes = [];
+  for (const part of text.split(/(\*\*[^*]+\*\*|`[^`]+`)/)) {
+    if (!part) continue;
+    if (part.startsWith("**") && part.endsWith("**")) nodes.push(el("b", { text: part.slice(2, -2) }));
+    else if (part.startsWith("`") && part.endsWith("`")) nodes.push(el("code", { text: part.slice(1, -1) }));
+    else nodes.push(document.createTextNode(part));
+  }
+  return nodes;
+}
+
+function renderAnswer(text) {
+  const blocks = [];
+  let list = null;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    const bullet = line.match(/^[-*•]\s+(.*)$/);
+    if (bullet) {
+      if (!list) { list = el("ul"); blocks.push(list); }
+      list.append(el("li", {}, inline(bullet[1])));
+      continue;
+    }
+    list = null;
+    if (line) blocks.push(el("p", {}, inline(line.replace(/^#+\s*/, ""))));
+  }
+  return el("div", { class: "body md" }, blocks);
+}
+
 function renderChat(snap) {
   const master = snap.agents.find((a) => a.master && a.status === "active");
   $("master-id").replaceChildren(master
@@ -269,7 +299,7 @@ function renderChat(snap) {
       const done = run.steps.filter((s) => s.status === "used").length;
       body = el("div", { class: "body typing", text: total ? `consulting specialists (${done}/${total})` : "planning" });
     } else if (run.status === "done") {
-      body = el("div", { class: "body", text: run.answer || "" });
+      body = renderAnswer(run.answer || "");
     } else {
       body = el("div", { class: "body", text: `Run ${run.status}. ${run.error || ""}` });
     }

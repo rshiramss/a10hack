@@ -182,6 +182,12 @@ master:
         - - {agent: RegistrationAgent, tool: find_patient, args: {name: Avery}}
         - - {agent: MedHistoryAgent, tool: get_allergies, args: {patient_id: P001}}
       between: "The first plan's typed result was {\"found\": true, \"patient_id\": \"P001\"}, so the follow-up plan uses P001."
+    - request: "Check P008's insurance coverage for each of their current medications."
+      plans:
+        - - {agent: MedHistoryAgent, tool: get_active_medications, args: {patient_id: P008}}
+        - - {agent: InsuranceAgent, tool: check_coverage, args: {patient_id: P008, drug: apixaban}}
+          - {agent: InsuranceAgent, tool: check_coverage, args: {patient_id: P008, drug: atorvastatin}}
+      between: "The first plan's typed result was {\"meds\": [\"apixaban\", \"atorvastatin\"]}, so the follow-up plan checks each of those drugs. Never ask the user for values a specialist can look up."
     - request: "How much does naproxen cost without insurance?"
       answer: "None of the specialists report cash prices. InsuranceAgent can give coverage and the monthly copay for a specific patient instead."
 

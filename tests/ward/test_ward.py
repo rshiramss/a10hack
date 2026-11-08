@@ -815,3 +815,24 @@ def test_groq_model_is_picked_from_what_the_key_can_use() -> None:
     )
     ReasoningAware(inner).chat.completions.create(model="openai/gpt-oss-20b", max_tokens=900)
     assert seen["reasoning_effort"] == "low" and seen["max_tokens"] == 4096
+
+
+def test_rate_limited_model_falls_back_to_the_next_one() -> None:
+    from ward.llm import ReasoningAware
+
+    calls = []
+
+    class Limited(Exception):
+        status_code = 429
+
+    def create(**kw: Any) -> str:
+        calls.append(kw["model"])
+        if kw["model"] == "openai/gpt-oss-120b":
+            raise Limited("TPM")
+        return "ok"
+
+    inner = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    client = ReasoningAware(inner, ["openai/gpt-oss-120b", "openai/gpt-oss-20b"])
+    assert client.chat.completions.create(model="openai/gpt-oss-120b", max_tokens=900) == "ok"
+    assert calls == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+    assert client.last_model == "openai/gpt-oss-20b"

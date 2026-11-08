@@ -91,33 +91,63 @@ GROQ_PREFERENCE = (
 
 
 class ReasoningAware:
-    """Wraps an OpenAI-compatible client. For reasoning models (gpt-oss), asks for low
-    reasoning effort and leaves room for the answer after the reasoning tokens."""
+    """Wraps an OpenAI-compatible client.
 
-    def __init__(self, client: Any) -> None:
+    - Reasoning models (gpt-oss): low reasoning effort, and room for the answer after the
+      reasoning tokens.
+    - Rate limits: Groq limits tokens per minute per model, so on a 429 the same request
+      goes to the next model this key can use (`fallbacks`), in preference order.
+    """
+
+    def __init__(self, client: Any, fallbacks: list[str] | None = None) -> None:
         self._client = client
+        self.fallbacks = list(fallbacks or [])
+        self.last_model: str | None = None
         self.chat = SimpleNamespace(completions=self)
 
-    def create(self, **kwargs: Any) -> Any:
+    @staticmethod
+    def _tune(kwargs: dict[str, Any]) -> dict[str, Any]:
+        kwargs = dict(kwargs)
         if "gpt-oss" in str(kwargs.get("model", "")):
             kwargs.setdefault("reasoning_effort", "low")
             kwargs["max_tokens"] = max(int(kwargs.get("max_tokens") or 0), 4096)
-        return self._client.chat.completions.create(**kwargs)
+        else:
+            kwargs.pop("reasoning_effort", None)
+        return kwargs
+
+    def create(self, **kwargs: Any) -> Any:
+        first = kwargs.get("model")
+        order = [first] + [m for m in self.fallbacks if m != first]
+        last_error: Exception | None = None
+        for model in order:
+            try:
+                reply = self._client.chat.completions.create(
+                    **self._tune({**kwargs, "model": model})
+                )
+                self.last_model = model
+                return reply
+            except Exception as exc:  # noqa: BLE001 - only rate limits fall through
+                if getattr(exc, "status_code", None) != 429:
+                    raise
+                last_error = exc
+        raise last_error  # every model is rate-limited right now
+
+
+def usable_groq_models(client: Any) -> list[str]:
+    """Tool-capable models this key can use, best first."""
+    try:
+        available = {m.id for m in client.models.list().data}
+    except Exception:  # noqa: BLE001
+        return list(GROQ_PREFERENCE)
+    return [name for name in GROQ_PREFERENCE if name in available]
 
 
 def pick_groq_model(client: Any, preferred: str | None) -> str:
     """The configured model if set; else the best model this key can actually use."""
     if preferred:
         return preferred
-    try:
-        available = {m.id for m in client.models.list().data}
-    except Exception:  # noqa: BLE001 - fall back to the first preference
-        return GROQ_PREFERENCE[0]
-    for name in GROQ_PREFERENCE:
-        if name in available:
-            return name
-    chat_models = sorted(m for m in available if "whisper" not in m and "guard" not in m)
-    return chat_models[0] if chat_models else GROQ_PREFERENCE[0]
+    usable = usable_groq_models(client)
+    return usable[0] if usable else GROQ_PREFERENCE[0]
 
 
 def make_llm(num_ctx: int = 8192) -> tuple[Any, str]:
@@ -131,7 +161,9 @@ def make_llm(num_ctx: int = 8192) -> tuple[Any, str]:
         return OllamaNative(base_url, num_ctx=num_ctx), model
     from openai import OpenAI
 
-    client = OpenAI(base_url=base_url, api_key=api_key, timeout=120)
+    client = OpenAI(base_url=base_url, api_key=api_key, timeout=120, max_retries=1)
+    fallbacks: list[str] = []
     if provider == "groq":
         model = pick_groq_model(client, os.environ.get("BADGE_MODEL") or None)
-    return ReasoningAware(client), model
+        fallbacks = usable_groq_models(client)
+    return ReasoningAware(client, fallbacks), model
