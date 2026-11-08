@@ -1,7 +1,7 @@
 """Badge demo, about 2-3 minutes. Open the dashboard URL it prints while it runs.
 
   uv run python -m scripts.demo            # scripted agents, no API key, deterministic
-  uv run python -m scripts.demo --live     # Claude drives the assessors (ANTHROPIC_API_KEY)
+  uv run python -m scripts.demo --live     # an LLM drives the assessors (local Ollama by default)
 
 Options: --pace SECONDS between beats (default 3), --port (default 8000), --exit to stop
 the server when the story ends instead of leaving the dashboard up.
@@ -177,17 +177,24 @@ def scripted_assess(
 
 
 class LiveAssessor:
-    """Claude drives the assessor; a scripted fallback finishes anything it leaves undone."""
+    """An LLM drives the assessor; a scripted fallback finishes anything it leaves undone."""
 
     def __init__(self, model: str | None) -> None:
         self.model = model
         self.last_transcript: Any = None
 
     def run(self, client: GatewayClient, narrator: Narrator) -> Any:
-        from agents.runner import run_llm_agent
+        from agents.runner import llm_settings, run_agent
 
-        narrator.say(f"Claude is driving {client.name}…")
-        transcript = run_llm_agent(client, "assessor", model=self.model)
+        model = self.model or llm_settings()[3]
+        narrator.say(f"{model} is driving {client.name}…")
+        try:
+            transcript = run_agent(client, "assessor", model=self.model)
+        except Exception as exc:  # noqa: BLE001 - the demo must keep going
+            narrator.say(f"LLM call failed ({type(exc).__name__}); scripted fallback takes over.")
+            from agents.runner import AgentTranscript
+
+            transcript = AgentTranscript()
         for record in transcript.calls:
             narrator.show(client.name, record.tool, record.response)
         self.last_transcript = transcript
@@ -265,7 +272,7 @@ def run_story(
         went_rogue = assess.run(a, narrator).called("get_assignment")
         if not went_rogue:
             narrator.say(
-                "Claude ignored the injection. Here is what happens to an agent that doesn't:"
+                "The model ignored the injection. Here is what happens to an agent that doesn't:"
             )
     else:
         open_injected_visit(a, narrator)
@@ -339,14 +346,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--scripted", action="store_true", help="scripted agents (default)")
-    mode.add_argument("--live", action="store_true", help="Claude drives the assessors")
+    mode.add_argument("--live", action="store_true", help="an LLM drives the assessors")
     parser.add_argument("--pace", type=float, default=3.0)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--exit", action="store_true", help="stop when the story ends")
     args = parser.parse_args()
-    if args.live and not os.environ.get("ANTHROPIC_API_KEY"):
-        print("--live needs ANTHROPIC_API_KEY; use --scripted otherwise.")
-        return 2
+    if args.live:
+        from agents.runner import check_llm_ready
+
+        problem = check_llm_ready()
+        if problem:
+            print(f"--live: {problem}. Or use --scripted.")
+            return 2
 
     create_seeded_database(DEMO_DB)
     settings, logins = demo_settings(args.port)

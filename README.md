@@ -20,8 +20,53 @@ the agents being governed.
 uv sync                                   # Python 3.11+
 cp .env.example .env                      # then set BADGE_SIGNING_KEY (32+ chars)
 uv run pytest -q                          # full suite, including the 24 required attacks
-uv run python -m scripts.demo             # scripted 2-3 minute demo, no API key needed
+uv run python -m scripts.mcp_demo         # the A10 track demo over MCP (~1 minute)
+uv run python -m scripts.demo             # the full 2-3 minute story, no API key needed
 ```
+
+## The A10 demo: authenticate → selected MCP tools → revoke mid-task → blocked
+
+`scripts/mcp_demo.py` runs the track's demo exactly, over real MCP:
+
+1. **Authenticate.** The orchestrator provisions `assessor-a` as a workload (client id +
+   secret, stored only as an HMAC). The agent's own process trades them at
+   `POST /auth/agent/token` (OAuth2 `client_credentials`) for a 15-minute badge. A wrong
+   secret is refused and logged as a high-severity `AUTH_FAILED` event.
+2. **Selected MCP tools.** The agent connects to `POST /mcp` with the badge as a Bearer
+   token. `tools/list` returns only its role's tools; the pharmacist, on the same server,
+   sees `get_assignment`, and the assessor doesn't.
+3. **Work, then revoke mid-task.** The agent declares its plan, opens the visit, records
+   one score. A monitor revokes it (automatically, or you click **Revoke** on the dashboard
+   with `--manual`).
+4. **Blocked.** The next `tools/call`, `tools/list`, `initialize`, and even a fresh token
+   exchange with valid credentials all fail with `DENY_REVOKED`, and each is in the audit log.
+
+| Flag | Effect |
+|---|---|
+| (none) | Scripted agent; a monitor revokes automatically after the first score. |
+| `--manual` | Waits for you to click Revoke on the dashboard. Best for a live demo. |
+| `--live` | A local LLM drives the agent through MCP (see below). |
+| `--pace 2`, `--port 8000`, `--exit` | Same as `scripts.demo`. |
+
+At the end it prints a `claude mcp add ...` command with a fresh badge, so you can plug a
+real MCP client (Claude Code, Cursor, the MCP Inspector) into the gateway and watch it get
+the same treatment.
+
+### Local LLM (no API key)
+
+`--live` uses a small local model through Ollama's OpenAI-compatible API by default:
+
+```bash
+brew install ollama && ollama serve        # or the Ollama app
+ollama pull qwen2.5:3b                     # ~2 GB, fast on a laptop, good at tool calls
+uv run python -m scripts.mcp_demo --live
+uv run python -m scripts.demo --live
+```
+
+Switch backends with env vars (`BADGE_LLM_PROVIDER=ollama|openai|anthropic`, `BADGE_MODEL`,
+`BADGE_LLM_BASE_URL`, `BADGE_LLM_API_KEY`). Groq works as `openai` with
+`BADGE_LLM_BASE_URL=https://api.groq.com/openai/v1`. If the model wanders, the gateway
+still enforces everything, and both demos fall back to scripted steps to finish the story.
 
 The demo prints a dashboard URL (`http://127.0.0.1:8000/`) and two monitor logins.
 Open it while the story runs. Flags:
@@ -29,7 +74,7 @@ Open it while the story runs. Flags:
 | Flag | Effect |
 |---|---|
 | `--scripted` (default) | Deterministic scripted agents. The reliable fallback. |
-| `--live` | Claude drives the assessors (`ANTHROPIC_API_KEY`, model from `BADGE_MODEL`). If the model resists the prompt injection, the demo shows what happens to an agent that doesn't. |
+| `--live` | An LLM drives the assessors (local Ollama by default, see above). If the model resists the prompt injection, the demo shows what happens to an agent that doesn't. |
 | `--pace 3` | Seconds between story beats. Use `0` for a quick run. |
 | `--port 8000` | Gateway and dashboard port. |
 | `--exit` | Stop when the story ends instead of leaving the dashboard up. |
@@ -147,7 +192,10 @@ says so in a `# DECISION:` comment. The main ones:
 - The audit chain detects edits and deletions of past rows, but truncating the newest rows
   is only detectable against an externally anchored copy of the last hash.
 - SQLite with `BEGIN IMMEDIATE` serializes all writers. Fine for a demo, not for scale.
-- The MCP adapter (milestone M9, stretch) isn't built yet.
+- The MCP endpoint is stateless JSON (no SSE stream, no sessions) and expects the badge as
+  a Bearer header; it doesn't implement the MCP OAuth discovery flow.
+- Workload credentials are client secrets, not attested workload identity (SPIFFE, cloud
+  instance identity). The token endpoint is the place to plug one in.
 
 ## Layout
 
@@ -159,8 +207,10 @@ badge/                  core library (no FastAPI imports)
   schemas.py budgets.py scanners.py redaction.py idempotency.py revocation.py audit.py
   tools/                tool implementations, called only by the pipeline
   views.py              read-only dashboard snapshot
-server/app.py           FastAPI gateway + dashboard (server/dashboard/)
-agents/                 HTTP client, scripted agents, Claude tool-use runner, prompts
-scripts/                seed.py, demo.py, verify_audit.py
+  workload.py           client-credentials login -> badge
+  mcp.py                MCP JSON-RPC handling (initialize, tools/list, tools/call)
+server/app.py           FastAPI gateway + dashboard (server/dashboard/), /mcp, /auth/agent/token
+agents/                 HTTP + MCP clients, scripted agents, LLM runners (Ollama/OpenAI/Claude)
+scripts/                seed.py, demo.py, mcp_demo.py, verify_audit.py
 tests/                  unit/, integration/, attacks/ (the 24 required attack tests)
 ```

@@ -1,6 +1,10 @@
 """FastAPI gateway + monitor dashboard.
 
+Agent authentication (workload identity, OAuth2 client_credentials):
+  POST /auth/agent/token  form or JSON {grant_type, client_id, client_secret} -> badge
+
 Agent endpoints (Authorization: Bearer <badge>):
+  POST /mcp              MCP (Streamable HTTP, JSON responses): tools/list, tools/call
   POST /tools/{name}     body {"args": {...}, "idempotency_key": "<uuid>"}
   POST /declare_plan     body {"task_id": ..., "steps": [...]}
   GET  /list_my_tools
@@ -24,18 +28,19 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from badge import db, identity
+from badge import db, identity, mcp, workload
 from badge.clock import Clock, SystemClock
 from badge.config import DEFAULT_CONFIG_PATH, load_config
 from badge.context import CallContext, CallRequest, Runtime
 from badge.db import write_tx
-from badge.decisions import Allow
+from badge.decisions import Allow, Deny
 from badge.pipeline import CallResult, handle_call
 from badge.tools.registry import check_registry
 from badge.views import dashboard_snapshot
@@ -196,6 +201,71 @@ def create_app(settings: Settings | None = None, clock: Clock | None = None) -> 
     async def list_my_tools(request: Request) -> JSONResponse:
         result = await run_in_threadpool(run_call, bearer_token(request), "list_my_tools", {}, None)
         return result_response(result)
+
+    # ---- agent authentication (workload identity) ------------------------------------
+
+    def exchange(client_id: str, client_secret: str) -> str | Deny:
+        with connection() as conn, write_tx(conn):
+            return workload.exchange_credentials(conn, runtime, client_id, client_secret)
+
+    @app.post("/auth/agent/token")
+    async def agent_token(request: Request) -> JSONResponse:
+        """OAuth2 client_credentials grant. The access token is the badge (a signed JWT)."""
+        if request.headers.get("content-type", "").startswith("application/json"):
+            body = await read_json(request)
+        else:
+            raw = (await request.body()).decode("utf-8", "replace")[:4096]
+            body = {k: v[0] for k, v in parse_qs(raw).items()}
+        if not isinstance(body, dict) or body.get("grant_type") != "client_credentials":
+            return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+        client_id = str(body.get("client_id", ""))
+        if not throttle.allow(f"agent:{client_id[:64]}"):
+            return JSONResponse({"error": "slow_down"}, status_code=429)
+        result = await run_in_threadpool(exchange, client_id, str(body.get("client_secret", "")))
+        if isinstance(result, Deny):
+            return JSONResponse(
+                {"error": "invalid_client", "reason": result.reason}, status_code=401
+            )
+        info = identity.decode_badge(runtime, result, runtime.clock.now())
+        expires_in = int(info.expires_at - runtime.clock.now()) if not isinstance(info, Deny) else 0
+        return JSONResponse(
+            {"access_token": result, "token_type": "Bearer", "expires_in": expires_in},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # ---- MCP -------------------------------------------------------------------------
+
+    mutating_tools = {name for name, spec in config.tools.items() if spec.mutating}
+
+    def mcp_check_badge(token: str | None) -> str | None:
+        with connection() as conn:
+            ctx = CallContext(runtime, conn, CallRequest(token, "mcp", {}), runtime.clock.now())
+            decision = identity.check_badge(ctx)
+        return None if isinstance(decision, Allow) else decision.reason
+
+    def mcp_handle(token: str | None, message: Any) -> mcp.McpReply:
+        def run(tool: str, args: Any, key: str | None) -> dict[str, Any]:
+            return run_call(token, tool, args, key).to_json()
+
+        return mcp.handle_message(message, lambda: mcp_check_badge(token), run, mutating_tools)
+
+    @app.post("/mcp")
+    async def mcp_endpoint(request: Request) -> Response:
+        try:
+            message = json.loads(await request.body())
+        except (ValueError, UnicodeDecodeError):
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+            )
+        reply = await run_in_threadpool(mcp_handle, bearer_token(request), message)
+        if reply.body is None:
+            return Response(status_code=202)
+        return JSONResponse(reply.body, status_code=reply.status)
+
+    @app.api_route("/mcp", methods=["GET", "DELETE"])
+    def mcp_no_stream() -> Response:
+        # No server-initiated stream and no sessions to end.
+        return Response(status_code=405, headers={"Allow": "POST"})
 
     @app.get("/favicon.ico")
     def favicon() -> Response:

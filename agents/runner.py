@@ -1,4 +1,11 @@
-"""LLM agent loop (Claude tool use) that works only through the gateway.
+"""LLM agent loops that work only through the gateway.
+
+Two backends, picked by BADGE_LLM_PROVIDER (see `run_agent`):
+  ollama     (default) a small local model through Ollama's OpenAI-compatible API
+  openai     any OpenAI-compatible endpoint (Groq, LM Studio, vLLM, OpenAI) via
+             BADGE_LLM_BASE_URL + BADGE_LLM_API_KEY
+  anthropic  Claude via ANTHROPIC_API_KEY
+
 
 On start: list_my_tools -> the model checks status, declares a plan, executes, stops.
 Deny reasons go back to the model as tool results. The system prompt describes the job
@@ -15,36 +22,16 @@ from pathlib import Path
 from typing import Any
 
 from agents.client import GatewayClient
+from badge import tool_schemas
 
-DEFAULT_MODEL = "claude-sonnet-5-5"
+DEFAULT_MODEL = "claude-sonnet-5-5"  # anthropic backend
+DEFAULT_LOCAL_MODEL = "qwen2.5:3b"  # small, fast, solid at tool calls
+OLLAMA_BASE_URL = "http://localhost:11434/v1"
 MAX_TOKENS = 1024
 MAX_TURNS = 14
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 HIDDEN_FROM_MODEL = {"list_my_tools"}  # the runner already called it
 KICKOFF = "Your badge is active. Begin your work."
-
-# declare_plan nests steps, so its schema is written out here instead of derived from args.
-DECLARE_PLAN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "task_id": {"type": "string", "description": "Your task_id from get_my_status."},
-        "steps": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "tool": {"type": "string"},
-                    "args": {
-                        "type": "object",
-                        "description": "Only the args marked bind_in_plan for that tool.",
-                    },
-                },
-                "required": ["tool", "args"],
-            },
-        },
-    },
-    "required": ["task_id", "steps"],
-}
 
 
 @dataclass
@@ -64,42 +51,33 @@ class AgentTranscript:
         return any(record.tool == tool for record in self.calls)
 
 
-def _json_schema_for_arg(spec: dict[str, Any]) -> dict[str, Any]:
-    kind = spec["type"]
-    if kind == "enum":
-        return {"type": "string", "enum": spec["values"]}
-    if kind == "int":
-        return {"type": "integer", "minimum": spec["min"], "maximum": spec["max"]}
-    if kind == "bool":
-        return {"type": "boolean"}
-    schema: dict[str, Any] = {"type": "string"}
-    if "pattern" in spec:
-        schema["pattern"] = spec["pattern"]
-    if "max_len" in spec:
-        schema["maxLength"] = spec["max_len"]
-    return schema
-
-
 def to_anthropic_tools(listing: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Gateway tool listing -> Claude tool definitions."""
-    tools = []
-    for tool in listing:
-        if tool["name"] in HIDDEN_FROM_MODEL:
-            continue
-        if tool["name"] == "declare_plan":
-            schema = DECLARE_PLAN_SCHEMA
-        else:
-            schema = {
-                "type": "object",
-                "properties": {n: _json_schema_for_arg(s) for n, s in tool["args"].items()},
-                "required": [n for n, s in tool["args"].items() if not s["optional"]],
-            }
-        bound = [n for n, s in tool["args"].items() if s.get("bind_in_plan")]
-        description = tool["description"]
-        if bound:
-            description += f" Plan steps for this tool bind: {', '.join(bound)}."
-        tools.append({"name": tool["name"], "description": description, "input_schema": schema})
-    return tools
+    return [
+        {
+            "name": tool["name"],
+            "description": tool_schemas.description(tool),
+            "input_schema": tool_schemas.input_schema(tool),
+        }
+        for tool in listing
+        if tool["name"] not in HIDDEN_FROM_MODEL
+    ]
+
+
+def to_openai_tools(listing: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Gateway tool listing -> OpenAI-style function tools (Ollama, Groq, LM Studio...)."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool_schemas.description(tool),
+                "parameters": tool_schemas.input_schema(tool),
+            },
+        }
+        for tool in listing
+        if tool["name"] not in HIDDEN_FROM_MODEL
+    ]
 
 
 def _execute_tool_use(
@@ -131,9 +109,12 @@ def run_llm_agent(
         import anthropic
 
         anthropic_client = anthropic.Anthropic()
-    model = model or os.environ.get("BADGE_MODEL", DEFAULT_MODEL)
-    listing = client.list_my_tools().get("result", {}).get("tools", [])
+    model = model or os.environ.get("BADGE_MODEL") or DEFAULT_MODEL
+    # A denied listing (e.g. the badge is already revoked) leaves the model no tools.
+    listing = (client.list_my_tools().get("result") or {}).get("tools", [])
     tools = to_anthropic_tools(listing)
+    if not tools:
+        return AgentTranscript(final_text="no tools available for this badge")
     mutating = {tool["name"] for tool in listing if tool["mutating"]}
     system = (PROMPTS_DIR / f"{role}.md").read_text(encoding="utf-8")
     messages: list[dict[str, Any]] = [{"role": "user", "content": KICKOFF}]
@@ -168,3 +149,123 @@ def run_llm_agent(
             )
         messages.append({"role": "user", "content": results})
     return transcript
+
+
+# ---- OpenAI-compatible backend (Ollama by default) ----------------------------------
+
+
+def llm_settings() -> tuple[str, str, str, str]:
+    """(provider, base_url, api_key, model) from the environment."""
+    provider = os.environ.get("BADGE_LLM_PROVIDER", "ollama").strip().lower()
+    if provider == "anthropic":
+        return provider, "", "", os.environ.get("BADGE_MODEL") or DEFAULT_MODEL
+    base_url = os.environ.get("BADGE_LLM_BASE_URL") or OLLAMA_BASE_URL
+    api_key = os.environ.get("BADGE_LLM_API_KEY") or "ollama"  # Ollama ignores the key
+    model = os.environ.get("BADGE_MODEL") or DEFAULT_LOCAL_MODEL
+    return provider, base_url, api_key, model
+
+
+def run_openai_agent(
+    client: GatewayClient,
+    role: str,
+    openai_client: Any | None = None,
+    model: str | None = None,
+    max_turns: int = MAX_TURNS,
+) -> AgentTranscript:
+    """Drive one agent through an OpenAI-compatible chat API with tool calling."""
+    _, base_url, api_key, default_model = llm_settings()
+    if openai_client is None:
+        from openai import OpenAI
+
+        openai_client = OpenAI(base_url=base_url, api_key=api_key, timeout=60)
+    model = model or default_model
+    # A denied listing (e.g. the badge is already revoked) leaves the model no tools.
+    listing = (client.list_my_tools().get("result") or {}).get("tools", [])
+    tools = to_openai_tools(listing)
+    if not tools:
+        return AgentTranscript(final_text="no tools available for this badge")
+    mutating = {tool["name"] for tool in listing if tool["mutating"]}
+    system = (PROMPTS_DIR / f"{role}.md").read_text(encoding="utf-8")
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": KICKOFF},
+    ]
+    transcript = AgentTranscript()
+
+    for _ in range(max_turns):
+        reply = openai_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tools,
+            temperature=0,
+            max_tokens=MAX_TOKENS,
+        )
+        message = reply.choices[0].message
+        tool_calls = list(message.tool_calls or [])
+        messages.append(
+            {
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments or "{}",
+                        },
+                    }
+                    for call in tool_calls
+                ],
+            }
+            if tool_calls
+            else {"role": "assistant", "content": message.content or ""}
+        )
+        if not tool_calls:
+            transcript.final_text = message.content or ""
+            break
+        for call in tool_calls:
+            try:
+                tool_input = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                tool_input = {}
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            # Small models sometimes return a tool call with no id; give it a stable one.
+            call_id = call.id or str(uuid.uuid4())
+            record = _execute_tool_use(client, call.function.name, tool_input, mutating, call_id)
+            transcript.calls.append(record)
+            messages.append(
+                {"role": "tool", "tool_call_id": call_id, "content": json.dumps(record.response)}
+            )
+    return transcript
+
+
+def run_agent(client: GatewayClient, role: str, model: str | None = None) -> AgentTranscript:
+    """Run one LLM agent with whichever backend BADGE_LLM_PROVIDER selects."""
+    provider = llm_settings()[0]
+    if provider == "anthropic":
+        return run_llm_agent(client, role, model=model)
+    return run_openai_agent(client, role, model=model)
+
+
+def check_llm_ready() -> str | None:
+    """None if the configured LLM backend looks usable, else a message saying what's wrong."""
+    provider, base_url, api_key, model = llm_settings()
+    if provider == "anthropic":
+        return None if os.environ.get("ANTHROPIC_API_KEY") else "set ANTHROPIC_API_KEY"
+    if provider not in ("ollama", "openai"):
+        return f"unknown BADGE_LLM_PROVIDER {provider!r} (use ollama, openai, or anthropic)"
+    if provider == "openai":
+        return None if os.environ.get("BADGE_LLM_API_KEY") else "set BADGE_LLM_API_KEY"
+    import httpx
+
+    root = base_url.rstrip("/").removesuffix("/v1")
+    try:
+        tags = httpx.get(f"{root}/api/tags", timeout=3).json()
+    except (httpx.HTTPError, ValueError):
+        return f"Ollama isn't reachable at {root}. Install it and run `ollama serve`"
+    names = {m.get("name", "") for m in tags.get("models", [])}
+    if model not in names and f"{model}:latest" not in names:
+        return f"model {model} isn't pulled. Run: ollama pull {model}"
+    return None

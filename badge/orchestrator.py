@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from badge import identity, leases, tasks
+from badge import identity, leases, tasks, workload
 from badge.context import Runtime
 from badge.db import write_tx
 
@@ -29,6 +29,19 @@ def enroll_agent(conn: sqlite3.Connection, runtime: Runtime, agent_id: str, role
     with write_tx(conn):
         identity.register_agent(conn, runtime, agent_id, role)
         return identity.issue_badge(conn, runtime, agent_id)
+
+
+def provision_workload(conn: sqlite3.Connection, runtime: Runtime, agent_id: str, role: str) -> str:
+    """Register an agent that authenticates itself (POST /auth/agent/token).
+
+    Returns the client secret, shown once. No badge is issued here: the agent's own
+    process trades the credentials for one.
+    """
+    with write_tx(conn):
+        exists = conn.execute("SELECT 1 FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
+        if exists is None:
+            identity.register_agent(conn, runtime, agent_id, role)
+        return workload.provision_credentials(conn, runtime, agent_id)
 
 
 def reissue_badge(conn: sqlite3.Connection, runtime: Runtime, agent_id: str) -> str:

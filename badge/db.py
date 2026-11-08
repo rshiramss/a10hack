@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 10_000
 
 _APPEND_ONLY_TABLES = ("audit_log", "outcomes", "outcome_flags", "submissions")
@@ -31,6 +31,14 @@ CREATE TABLE badges (
     role          TEXT NOT NULL,
     issued_at_ms  INTEGER NOT NULL,
     expires_at_ms INTEGER NOT NULL
+);
+
+-- Workload credentials (OAuth2 client_credentials style). Only an HMAC of the secret is
+-- stored; the plaintext is shown once, to the orchestrator that provisioned it.
+CREATE TABLE agent_credentials (
+    agent_id      TEXT PRIMARY KEY REFERENCES agents(agent_id),
+    secret_hmac   TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
 );
 
 CREATE TABLE revocations (
@@ -280,6 +288,15 @@ def migrate(conn: sqlite3.Connection) -> None:
     """Create the schema if the database is new. Idempotent."""
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version >= SCHEMA_VERSION:
+        return
+    if version == 1:
+        # v1 -> v2 only adds the workload credentials table.
+        conn.executescript(
+            "BEGIN IMMEDIATE;\n"
+            "CREATE TABLE agent_credentials (agent_id TEXT PRIMARY KEY REFERENCES"
+            " agents(agent_id), secret_hmac TEXT NOT NULL, created_at_ms INTEGER NOT NULL);\n"
+            f"PRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
+        )
         return
     conn.executescript(
         "BEGIN IMMEDIATE;\n"
