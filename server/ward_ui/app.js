@@ -14,7 +14,8 @@ const KEY_KINDS = new Set([
 const ICON = { ALLOW: "✓", DENY: "✗", EVENT: "•" };
 
 const state = { lastSeq: 0, epoch: null, audit: [], filter: "key", open: new Set(), snap: null,
-                examplesShown: false, settingsShown: false, mcpRolesShown: false, fresh: new Set() };
+                examplesShown: false, settingsShown: false, mcpRolesShown: false, fresh: new Set(),
+                selectedLease: null, showMasterSaw: false };
 
 const $ = (id) => document.getElementById(id);
 function el(tag, attrs = {}, children = []) {
@@ -263,7 +264,8 @@ function renderRun(snap) {
       const refused = kinds.includes("HANDSHAKE_REFUSED");
       const discarded = kinds.includes("RESULT_DISCARDED");
       const args = Object.entries(step.args).map(([k, v]) => `${k}=${v}`).join(", ");
-      items.push(el("li", { class: `step ${step.status}` }, [
+      const selected = state.selectedLease === step.lease_id;
+      const li = el("li", { class: `step ${step.status} ${selected ? "selected" : ""}` }, [
         el("span", { class: "step-num", text: String(step.index + 1) }),
         el("div", {}, [
           el("div", { class: "step-call" }, [
@@ -284,10 +286,31 @@ function renderRun(snap) {
         el("span", { class: `pill ${step.status}`, text: { used: "done", active: "leased", failed: "failed",
           revoked: "revoked", expired: "expired", unused: "not run",
           awaiting_approval: "awaiting approval" }[step.status] || step.status }),
-      ]));
+      ]);
+      li.addEventListener("click", () => {
+        state.selectedLease = step.lease_id;
+        renderHandshake(step.handshake);
+        renderRun(state.snap);
+      });
+      items.push(li);
     });
   }
   steps.replaceChildren(...items);
+  if (state.selectedLease) {
+    const step = run.steps.find((s) => s.lease_id === state.selectedLease);
+    if (step) renderHandshake(step.handshake);
+  } else if (run.steps.length) {
+    state.selectedLease = run.steps[run.steps.length - 1].lease_id;
+    renderHandshake(run.steps[run.steps.length - 1].handshake);
+  }
+}
+
+function renderHandshake(hs) {
+  if (typeof drawHandshake !== "function") return;
+  drawHandshake($("handshake-viz"), hs, {
+    showMaster: state.showMasterSaw,
+    onSelect: (hop) => {},
+  });
 }
 
 // ---- security log ---------------------------------------------------------------------
@@ -477,5 +500,13 @@ document.addEventListener("DOMContentLoaded", () => {
     document.querySelectorAll(".seg-btn").forEach((x) => x.classList.toggle("on", x === b));
     state.filter = b.dataset.filter; renderLog();
   }));
+  $("master-saw-toggle").addEventListener("change", (e) => {
+    state.showMasterSaw = e.target.checked;
+    if (state.snap && state.selectedLease) {
+      const run = state.snap.runs[0];
+      const step = run && run.steps.find((s) => s.lease_id === state.selectedLease);
+      if (step) renderHandshake(step.handshake);
+    }
+  });
   poll();
 });

@@ -145,6 +145,24 @@ button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
 .approval-card { border: 1px solid var(--rule); padding: 0.6rem 0.75rem; }
 .approval-title { font-weight: 700; }
 .approval-actions { display: flex; gap: 0.5rem; margin-top: 0.4rem; }
+.handshake-panel { margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--hairline); }
+.handshake-viz { min-height: 120px; }
+.hs-svg { width: 100%; max-width: 560px; height: auto; color: var(--ink); }
+.hs-lane { stroke: var(--hairline); stroke-width: 1; stroke-dasharray: 3 4; }
+.hs-lane-label { font-size: 10px; fill: var(--muted); font-family: var(--font-data); }
+.hs-hop { opacity: 0; transition: opacity 0.25s var(--ease); cursor: pointer; }
+.hs-hop.visible { opacity: 1; }
+.hs-hop.fail .hs-arrow, .hs-hop.fail .hs-hop-label { color: var(--deny); stroke: var(--deny); fill: var(--deny); }
+.hs-hop.ok .hs-arrow { stroke: var(--allow); }
+.hs-hop.pending .hs-arrow { stroke: var(--warn); stroke-dasharray: 4 3; }
+.hs-arrow { stroke-width: 1.5; }
+.hs-hop-label { font-size: 9px; fill: currentColor; font-family: var(--font-data); }
+.hs-inspector, .hs-master-body { margin: 0.5rem 0 0; padding: 0.5rem; background: var(--surface); border: 1px solid var(--hairline); font-size: var(--text-xs); white-space: pre-wrap; overflow: auto; max-height: 160px; }
+.hs-master-label { font-weight: 700; margin-top: 0.5rem; font-size: var(--text-sm); }
+.step.selected { outline: 2px solid var(--event); background: var(--event-wash); }
+@media (prefers-reduced-motion: reduce) {
+  .hs-hop { opacity: 1; transition: none; }
+}
 .agent .name { font-weight: 800; }
 .agent .meta { color: var(--muted); font-size: var(--text-xs); }
 .agent { overflow: hidden; }

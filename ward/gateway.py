@@ -1392,6 +1392,7 @@ class Gateway:
             self._denied(
                 master, "DENY_POP_MISMATCH", "specialist's key signature didn't verify", run_id
             )
+        proof_hash_prefix = crypto.sha256_hex(reply["proof"])[:16]
         self._audit(
             "HANDSHAKE",
             f"{instance.agent_id} ⇄ gateway: delegation verified, key signature + HMAC proof checked",
@@ -1399,7 +1400,12 @@ class Gateway:
             run_id=run_id,
             actor=instance.agent_id,
             target=master.agent_id,
-            detail={"lease": lease_id, "proof": "HMAC-SHA256 over challenge"},
+            detail={
+                "lease": lease_id,
+                "proof": "HMAC-SHA256 over challenge",
+                "proof_hash_prefix": proof_hash_prefix,
+                "challenge_prefix": challenge[:16],
+            },
         )
         sealed_result = instance.run_tool(self.conn, reply["request"], lease_id)
         seal_key, _ = self.keys.instance_keys(instance.agent_id, target_badge.jti)
@@ -1488,6 +1494,8 @@ class Gateway:
             "UPDATE leases SET target_agent = ?, attempts = attempts + 1 WHERE lease_id = ?",
             (instance.agent_id, lease["lease_id"]),
         )
+        # Inspector fields only: claims subset + ciphertext prefix. Never raw JWT / keys.
+        box_hex = sealed.get("box", "")
         self._audit(
             "DELEGATED",
             f"{master.agent_id} → {instance.agent_id}: {lease['tool']} "
@@ -1496,7 +1504,20 @@ class Gateway:
             run_id=lease["run_id"],
             actor=master.agent_id,
             target=instance.agent_id,
-            detail={"lease": lease["lease_id"], "args": args, "inputs": inputs},
+            detail={
+                "lease": lease["lease_id"],
+                "args": args,
+                "inputs": inputs,
+                "delegation_claims": {
+                    "sub": master.agent_id,
+                    "sub_role": master.role,
+                    "aud": instance.agent_id,
+                    "lease": lease["lease_id"],
+                    "tool": lease["tool"],
+                    "exp": exp,
+                },
+                "ciphertext_prefix16": box_hex[:32],  # 16 bytes as hex
+            },
         )
         return {"delegation": delegation, "sealed": sealed}, uuid.uuid4().hex
 
@@ -1665,6 +1686,191 @@ class Gateway:
                 }
             ]
 
+    def _handshake_for_lease(
+        self, lease: sqlite3.Row, caller_label: str, result: Any
+    ) -> dict[str, Any]:
+        """Sequence-diagram payload for one lease from audit + lease state. No secrets."""
+        lease_id = lease["lease_id"]
+        events = list(
+            self.conn.execute(
+                "SELECT kind, decision, reason, detail_json FROM audit"
+                " WHERE detail_json LIKE ? ORDER BY seq",
+                (f'%"{lease_id}"%',),
+            )
+        )
+        by_kind = {e["kind"]: e for e in events}
+        details = {e["kind"]: json.loads(e["detail_json"] or "{}") for e in events}
+        specialist_label = (
+            lease["target_agent"] or self.config.roles[lease["role"]].display_name
+        )
+
+        def hop(
+            hop_id: str,
+            label: str,
+            frm: str,
+            to: str,
+            status: str,
+            inspector: dict | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "id": hop_id,
+                "label": label,
+                "from": frm,
+                "to": to,
+                "status": status,
+                "inspector": inspector or {},
+            }
+
+        hops: list[dict[str, Any]] = [
+            hop("signed_call", "signed call (badge + PoP)", "caller", "gateway", "ok")
+        ]
+        early_fail = lease["status"] in ("failed", "expired", "revoked") and "DELEGATED" not in by_kind
+        if early_fail:
+            hops.append(
+                hop(
+                    "badge_lease",
+                    "badge / key / lease checks",
+                    "gateway",
+                    "gateway",
+                    "fail",
+                    {"reason": lease["reason"]},
+                )
+            )
+            return {
+                "lease_id": lease_id,
+                "lanes": ["caller", "gateway", "specialist"],
+                "caller_label": caller_label,
+                "specialist_label": specialist_label,
+                "hops": hops,
+                "master_saw": None,
+                "approval": None,
+            }
+        hops.append(hop("badge_lease", "badge / key / lease checks", "gateway", "gateway", "ok"))
+
+        approval_pending = lease["status"] == "awaiting_approval"
+        approval_denied = lease["reason"] in ("DENY_APPROVAL_DENIED", "DENY_APPROVAL_TIMEOUT")
+        if "APPROVAL_REQUIRED" in by_kind or approval_pending or approval_denied:
+            if approval_pending:
+                st = "pending"
+            elif approval_denied:
+                st = "fail"
+            else:
+                st = "ok"
+            hops.append(
+                hop(
+                    "approval",
+                    "human approval",
+                    "gateway",
+                    "caller",
+                    st,
+                    {
+                        k: details.get("APPROVAL_REQUIRED", {}).get(k)
+                        for k in ("approval_id", "tool", "args", "evidence")
+                        if k in details.get("APPROVAL_REQUIRED", {})
+                    },
+                )
+            )
+            if st in ("fail", "pending"):
+                return {
+                    "lease_id": lease_id,
+                    "lanes": ["caller", "gateway", "specialist"],
+                    "caller_label": caller_label,
+                    "specialist_label": specialist_label,
+                    "hops": hops,
+                    "master_saw": None,
+                    "approval": st,
+                }
+
+        del_detail = details.get("DELEGATED", {})
+        mid = "ok" if "DELEGATED" in by_kind else ("pending" if lease["status"] == "active" else "fail")
+        hops.append(
+            hop(
+                "delegation",
+                "Ed25519 delegation",
+                "gateway",
+                "specialist",
+                mid,
+                {"delegation_claims": del_detail.get("delegation_claims", {})},
+            )
+        )
+        hops.append(
+            hop(
+                "sealed",
+                "AES-GCM sealed envelope",
+                "gateway",
+                "specialist",
+                mid,
+                {"ciphertext_prefix16": del_detail.get("ciphertext_prefix16", "")},
+            )
+        )
+        hs = "ok" if "HANDSHAKE" in by_kind else (
+            "fail" if "HANDSHAKE_REFUSED" in by_kind else (
+                "pending" if lease["status"] == "active" else "fail"
+            )
+        )
+        hops.append(
+            hop(
+                "challenge",
+                "challenge",
+                "gateway",
+                "specialist",
+                "ok" if hs != "pending" else "pending",
+                {"challenge_prefix": details.get("HANDSHAKE", {}).get("challenge_prefix", "")},
+            )
+        )
+        hops.append(
+            hop(
+                "proof",
+                "signed proof back",
+                "specialist",
+                "gateway",
+                hs,
+                {
+                    "proof_hash_prefix": details.get("HANDSHAKE", {}).get("proof_hash_prefix", ""),
+                    "reason": by_kind.get("HANDSHAKE_REFUSED", {}).get("reason"),
+                },
+            )
+        )
+        if hs == "fail":
+            return {
+                "lease_id": lease_id,
+                "lanes": ["caller", "gateway", "specialist"],
+                "caller_label": caller_label,
+                "specialist_label": specialist_label,
+                "hops": hops,
+                "master_saw": None,
+                "approval": None,
+            }
+
+        if "OUTPUT_REJECTED" in by_kind:
+            out_status, master_saw, reason = "fail", None, "DENY_OUTPUT_SCHEMA"
+        elif "RESULT_DISCARDED" in by_kind:
+            out_status, master_saw, reason = "fail", None, "DENY_REVOKED"
+        elif "DELIVERED" in by_kind:
+            out_status, master_saw, reason = "ok", result, None
+        else:
+            out_status = "pending" if lease["status"] in ("active", "awaiting_approval") else "fail"
+            master_saw, reason = None, lease["reason"]
+        hops.append(
+            hop(
+                "typed_output",
+                "typed fields only",
+                "specialist",
+                "caller",
+                out_status,
+                {"result": result, "reason": reason},
+            )
+        )
+        return {
+            "lease_id": lease_id,
+            "lanes": ["caller", "gateway", "specialist"],
+            "caller_label": caller_label,
+            "specialist_label": specialist_label,
+            "hops": hops,
+            "master_saw": master_saw,
+            "approval": "ok" if "APPROVAL_REQUIRED" in by_kind else None,
+        }
+
     # ---- snapshot for the UI ------------------------------------------------------------------
 
     def snapshot(self, after_seq: int = 0) -> dict[str, Any]:
@@ -1715,23 +1921,29 @@ class Gateway:
                 )
             runs = []
             for r in self.conn.execute("SELECT * FROM runs ORDER BY created_ms DESC LIMIT 10"):
-                steps = [
-                    {
-                        "lease_id": row["lease_id"],
-                        "plan_id": row["plan_id"],
-                        "index": row["step_index"],
-                        "agent": self.config.roles[row["role"]].display_name,
-                        "instance": row["target_agent"],
-                        "tool": row["tool"],
-                        "args": json.loads(row["args_json"]),
-                        "status": row["status"],
-                        "reason": row["reason"],
-                        "result": json.loads(row["result_json"]) if row["result_json"] else None,
-                    }
-                    for row in self.conn.execute(
-                        "SELECT * FROM leases WHERE run_id = ? ORDER BY rowid", (r["run_id"],)
+                caller_label = r["master_id"]
+                steps = []
+                for row in self.conn.execute(
+                    "SELECT * FROM leases WHERE run_id = ? ORDER BY rowid", (r["run_id"],)
+                ):
+                    result = json.loads(row["result_json"]) if row["result_json"] else None
+                    steps.append(
+                        {
+                            "lease_id": row["lease_id"],
+                            "plan_id": row["plan_id"],
+                            "index": row["step_index"],
+                            "agent": self.config.roles[row["role"]].display_name,
+                            "instance": row["target_agent"],
+                            "tool": row["tool"],
+                            "args": json.loads(row["args_json"]),
+                            "status": row["status"],
+                            "reason": row["reason"],
+                            "result": result,
+                            "handshake": self._handshake_for_lease(
+                                row, caller_label, result
+                            ),
+                        }
                     )
-                ]
                 plans = [
                     dict(p)
                     for p in self.conn.execute(

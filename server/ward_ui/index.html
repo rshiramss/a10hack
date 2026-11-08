@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,800&family=JetBrains+Mono:wght@400;600;800&display=swap">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/app.js" defer></script>
+  <script src="/static/handshake.js" defer></script>
 </head>
 <body>
   <header class="masthead">
@@ -75,6 +76,13 @@
         </div>
         <ol id="steps" class="steps"></ol>
         <p id="run-empty" class="muted">Send a request in the chat. The master agent plans which specialists to consult; the gateway checks the plan and mints one lease per step.</p>
+        <div class="handshake-panel">
+          <div class="panel-head">
+            <h3>Handshake</h3>
+            <label class="toggle"><input id="master-saw-toggle" type="checkbox"> what the master saw</label>
+          </div>
+          <div id="handshake-viz" class="handshake-viz"></div>
+        </div>
       </section>
 
       <section class="panel log" aria-labelledby="log-heading">
