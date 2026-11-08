@@ -1,0 +1,263 @@
+# Badge policy for the blinded-trial demo.
+# Everything the gateway enforces lives here. Enforcement code reads this file;
+# it never hard-codes role or tool names.
+
+trial_id: TRIAL-001
+badge_ttl_minutes: 15
+plan_ttl_minutes: 10
+emergency_lease_ttl_minutes: 5
+# Adjudicator: two reads "agree" when the largest per-measure delta is <= this.
+agree_threshold: 1
+# Cap applied to every string arg that does not declare its own max_len.
+default_string_max_len: 64
+
+platform_tools: [declare_plan, list_my_tools, get_my_status]
+
+roles:
+  pharmacist:
+    blinded: false
+    tools: [get_assignment, dispense_kit]
+    budgets:
+      max_steps_per_plan: 4
+      max_calls_per_minute: 30
+      max_reads_per_task: 1
+      max_denied_calls_per_badge: 3
+      max_replans_per_task: 1
+  assessor:
+    blinded: true
+    tools: [open_patient_visit, record_outcome, submit]
+    budgets:
+      max_steps_per_plan: 8
+      max_calls_per_minute: 20
+      max_reads_per_task: 1
+      max_denied_calls_per_badge: 3
+      max_replans_per_task: 1
+  adjudicator:
+    blinded: true
+    tools: [compare_reads]
+    budgets:
+      max_steps_per_plan: 2
+      max_calls_per_minute: 20
+      max_reads_per_task: 1
+      max_denied_calls_per_badge: 3
+      max_replans_per_task: 1
+  monitor:
+    # Monitors are humans using the dashboard. They stay blinded except through
+    # the two-person emergency unblind flow.
+    blinded: true
+    human: true
+    badge_ttl_minutes: 60
+    tools:
+      - view_audit
+      - revoke_badge
+      - flag_outcomes
+      - request_emergency_unblind
+      - approve_emergency_unblind
+      - view_emergency_unblind
+    budgets:
+      max_steps_per_plan: 0
+      max_calls_per_minute: 60
+      max_reads_per_task: 0
+      max_denied_calls_per_badge: 10
+      max_replans_per_task: 0
+
+# Arg types: id (regex), enum, int (bounded), text (free text, scanned), bool.
+#   bind: true          -> the arg must be bound to an exact value in the declared plan
+#   plan_wildcard: true -> the plan may bind "*" (any value of the enum)
+#   optional: true      -> may be omitted at call time
+tools:
+  # ---- platform -----------------------------------------------------------
+  declare_plan:
+    description: Declare the ordered tool calls you will make for one task. Returns leases.
+    planned: false
+    args: {}  # schema lives in badge/models.py (DeclarePlanArgs); it nests steps
+  list_my_tools:
+    description: List the tools your badge may use.
+    planned: false
+    args: {}
+  get_my_status:
+    description: Show your badge status, your assigned tasks, and active plan progress.
+    planned: false
+    args: {}
+
+  # ---- pharmacist (unblinded) --------------------------------------------
+  get_assignment:
+    description: Look up the treatment arm for a patient so the right kit is dispensed.
+    planned: true
+    workflow: pharmacy
+    resource_arg: visit_id
+    patient_arg: patient_id
+    counts_as_read: true
+    args:
+      patient_id: {type: id, pattern: "^P[0-9]{3}$", bind: true}
+      visit_id: {type: id, pattern: "^V-[0-9]{2}$", bind: true}
+  dispense_kit:
+    description: Dispense the drug kit for a patient visit.
+    planned: true
+    mutating: true
+    single_use: true
+    workflow: pharmacy
+    resource_arg: visit_id
+    patient_arg: patient_id
+    produces: H1
+    args:
+      patient_id: {type: id, pattern: "^P[0-9]{3}$", bind: true}
+      visit_id: {type: id, pattern: "^V-[0-9]{2}$", bind: true}
+
+  # ---- assessor (blinded) -------------------------------------------------
+  open_patient_visit:
+    description: Open your assigned visit record (clinical note) for scoring.
+    planned: true
+    workflow: assessor_read
+    resource_arg: visit_id
+    counts_as_read: true
+    preconditions:
+      - {channel: H1, field: kit_status, equals: dispensed}
+    redact_output: [note]
+    args:
+      visit_id: {type: id, pattern: "^V-[0-9]{2}$", bind: true}
+  record_outcome:
+    description: Record one outcome score (0-10) for your visit, with optional short notes.
+    planned: true
+    mutating: true
+    workflow: assessor_read
+    resource_arg: visit_id
+    args:
+      visit_id: {type: id, pattern: "^V-[0-9]{2}$", bind: true}
+      measure:
+        type: enum
+        values: [pain_score, mobility_score, global_impression]
+        bind: true
+        plan_wildcard: true
+      value: {type: int, min: 0, max: 10}
+      notes: {type: text, max_len: 500, optional: true, scan: [injection, arm_terms, canary]}
+  submit:
+    description: Lock and submit your recorded scores for the visit. Final.
+    planned: true
+    mutating: true
+    single_use: true
+    workflow: assessor_read
+    resource_arg: visit_id
+    produces: H2
+    args:
+      visit_id: {type: id, pattern: "^V-[0-9]{2}$", bind: true}
+
+  # ---- adjudicator (blinded) ----------------------------------------------
+  compare_reads:
+    description: Compare the two independent numeric reads for a visit.
+    planned: true
+    mutating: true
+    single_use: true
+    workflow: adjudication
+    resource_arg: visit_id
+    inputs: [H2]
+    produces: H3
+    args:
+      visit_id: {type: id, pattern: "^V-[0-9]{2}$", bind: true}
+
+  # ---- monitor (human, via dashboard) -------------------------------------
+  view_audit:
+    description: Read the audit log, optionally filtered to one agent.
+    planned: false
+    args:
+      agent_id: {type: id, pattern: "^[a-z][a-z0-9-]{1,40}$", optional: true}
+      limit: {type: int, min: 1, max: 500, optional: true}
+  revoke_badge:
+    description: Revoke an agent's badge immediately.
+    planned: false
+    mutating: true
+    severity: high
+    args:
+      agent_id: {type: id, pattern: "^[a-z][a-z0-9-]{1,40}$"}
+      reason: {type: text, max_len: 200, scan: [injection, canary]}
+  flag_outcomes:
+    description: Flag every outcome an agent recorded for human review.
+    planned: false
+    mutating: true
+    args:
+      agent_id: {type: id, pattern: "^[a-z][a-z0-9-]{1,40}$"}
+      reason: {type: text, max_len: 200, scan: [injection, canary]}
+  request_emergency_unblind:
+    description: Request emergency unblinding of one patient (needs a second monitor).
+    planned: false
+    mutating: true
+    severity: high
+    args:
+      patient_id: {type: id, pattern: "^P[0-9]{3}$"}
+      reason: {type: text, max_len: 300, scan: [injection, canary]}
+  approve_emergency_unblind:
+    description: Approve another monitor's emergency unblind request.
+    planned: false
+    mutating: true
+    severity: high
+    args:
+      request_id: {type: id, pattern: "^UNB-[A-Z0-9]{8}$"}
+  view_emergency_unblind:
+    description: Reveal the arm for an approved unblind request (single use, approver only).
+    planned: false
+    standing_lease: true
+    severity: high
+    args:
+      request_id: {type: id, pattern: "^UNB-[A-Z0-9]{8}$"}
+
+# State machines. Keyed in workflow_state by (workflow, resource_id, slot).
+workflows:
+  pharmacy:
+    slotted: false
+    initial: pending
+    terminal: [dispensed]
+    transitions:
+      - {tool: get_assignment, from: [pending], to: assigned_read}
+      - {tool: dispense_kit, from: [assigned_read], to: dispensed}
+  assessor_read:
+    slotted: true
+    hold_slot: true
+    initial: assigned
+    terminal: [locked]
+    transitions:
+      - {tool: open_patient_visit, from: [assigned], to: opened}
+      - {tool: record_outcome, from: [opened, recording], to: recording}
+      - {tool: submit, from: [recording], to: locked}
+  adjudication:
+    slotted: false
+    initial: waiting
+    terminal: [compared]
+    transitions:
+      - {tool: compare_reads, from: [ready], to: compared}
+    # The broker moves a visit to "ready" once every listed slot of the channel holds a value.
+    ready_when: {channel: H2, slots: [1, 2], from: waiting, to: ready}
+
+# Handoff channels. Values are typed: enum, int, bool, id, or a map of enum -> int.
+# Never free text.
+handoffs:
+  H1:
+    producer: {role: pharmacist, tool: dispense_kit}
+    consumer: {role: assessor, tool: open_patient_visit}
+    schema:
+      kit_status: {type: enum, values: [dispensed, not_dispensed]}
+      kit_id: {type: id, pattern: "^KIT-[A-Z0-9]{8}$"}
+  H2:
+    producer: {role: assessor, tool: submit}
+    consumer: {role: adjudicator, tool: compare_reads}
+    slotted: true
+    schema:
+      scores:
+        type: map
+        keys: [pain_score, mobility_score, global_impression]
+        values: {type: int, min: 0, max: 10}
+  H3:
+    producer: {role: adjudicator, tool: compare_reads}
+    consumer: {role: monitor, tool: dashboard}
+    schema:
+      result: {type: enum, values: [agree, disagree]}
+      max_delta: {type: int, min: 0, max: 10}
+
+scanners:
+  canary_pattern: "CANARY-[A-Z]+-[A-Z0-9]{6}"
+  arm_terms: [placebo, active arm, assignment, unblind]
+  # Compiled with re.MULTILINE so "^" matches the start of any line.
+  injection_patterns:
+    - "(?i)ignore (all|prior|previous) instructions"
+    - "(?i)^\\s*system:"
+
+redaction_terms: [rash, dry mouth, nausea]
