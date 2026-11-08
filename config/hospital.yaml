@@ -162,6 +162,29 @@ tools:
       order_id: {type: id, pattern: "^(ORD-[A-Z0-9]{8})?$"}
       block_reasons: {type: list, items: {type: enum, vocab: block_reason}, max_items: 5}
 
+# The master agent's model settings and worked examples. The examples teach the plan
+# format to small models; they use patients and drugs that aren't in the demo prompts,
+# and a test checks every example against this policy.
+master:
+  num_ctx: 8192        # Ollama context window; the default truncates the planner prompt
+  max_tokens: 900
+  few_shot:
+    - request: "Can P006 take doxycycline 200 mg/day? Draft it if it's safe."
+      plans:
+        - - {agent: MedHistoryAgent, tool: get_allergies, args: {patient_id: P006}}
+          - {agent: MedHistoryAgent, tool: get_active_medications, args: {patient_id: P006}}
+          - {agent: PharmacyAgent, tool: lookup_drug, args: {drug: doxycycline}}
+          - {agent: PharmacyAgent, tool: check_interactions, args: {patient_id: P006, drug: doxycycline}}
+          - {agent: LabsAgent, tool: get_renal_function, args: {patient_id: P006}}
+          - {agent: PrescriberAgent, tool: draft_order, args: {patient_id: P006, drug: doxycycline, daily_dose_mg: 200}}
+    - request: "What is Avery allergic to?"
+      plans:
+        - - {agent: RegistrationAgent, tool: find_patient, args: {name: Avery}}
+        - - {agent: MedHistoryAgent, tool: get_allergies, args: {patient_id: P001}}
+      between: "The first plan's typed result was {\"found\": true, \"patient_id\": \"P001\"}, so the follow-up plan uses P001."
+    - request: "How much does naproxen cost without insurance?"
+      answer: "None of the specialists report cash prices. InsuranceAgent can give coverage and the monthly copay for a specific patient instead."
+
 # Which allergy blocks which drug class (used by the prescriber's atomic function).
 allergy_blocks:
   penicillin: [penicillin]

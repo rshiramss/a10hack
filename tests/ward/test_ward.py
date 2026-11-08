@@ -284,18 +284,12 @@ def test_piped_inputs_must_match_shared_args(master) -> None:  # noqa: ANN001
 
 def test_three_denials_revoke_the_master(master) -> None:  # noqa: ANN001
     gw, token = master
-    run_id = gw.start_run(token("start_run"), "t")
-    bad = [{"agent": "LabsAgent", "tool": "get_renal_function", "args": {"patient_id": "x"}}]
-    for _ in range(2):
+    gw.start_run(token("start_run"), "t")
+    for _ in range(3):
         with pytest.raises(Denied):
-            gw.declare_plan(token("declare_plan"), run_id, bad)
-    with pytest.raises(Denied):
-        gw.consult(token("consult"), "L-NOPE")
+            gw.consult(token("consult"), "L-NOPE")  # misuse at run time counts
     with pytest.raises(Denied, match="DENY_REVOKED"):
         gw.check_badge(token.token)
-
-
-# ---- consults ------------------------------------------------------------------------------
 
 
 def test_allergy_blocks_the_order(master) -> None:  # noqa: ANN001
@@ -607,3 +601,180 @@ def test_after_a_rejected_plan_the_master_must_replan(gw: Gateway) -> None:
         gw.conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()[0]
         == "done"
     )
+
+
+# ---- model-output robustness -------------------------------------------------------------
+
+
+def msg(content: str = "", calls: list[tuple[str, str]] | None = None) -> SimpleNamespace:
+    tool_calls = [
+        SimpleNamespace(id=f"c{i}", function=SimpleNamespace(name=n, arguments=a))
+        for i, (n, a) in enumerate(calls or [])
+    ]
+    return SimpleNamespace(content=content, tool_calls=tool_calls or None)
+
+
+STEP = {"agent": "LabsAgent", "tool": "get_renal_function", "args": {"patient_id": "P001"}}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        msg(calls=[("declare_plan", json.dumps({"steps": [STEP]}))]),
+        msg(calls=[("declare_plan", json.dumps([STEP]))]),
+        msg(
+            "<tool_call>"
+            + json.dumps({"name": "declare_plan", "arguments": {"steps": [STEP]}})
+            + "</tool_call>"
+        ),
+        msg(f"Here's my plan:\n```json\n{json.dumps({'steps': [STEP]})}\n```"),
+        msg(json.dumps({"name": "declare_plan", "parameters": json.dumps({"steps": [STEP]})})),
+    ],
+)
+def test_plans_are_recognized_in_the_shapes_small_models_use(message) -> None:  # noqa: ANN001
+    from ward.master import _extract_steps
+
+    kind, steps = _extract_steps(message)
+    assert kind == "plan" and steps[0]["tool"] == "get_renal_function"
+
+
+def test_answer_and_garbage_are_told_apart() -> None:
+    from ward.master import _extract_steps
+
+    assert _extract_steps(msg(calls=[("answer_directly", '{"answer": "No prices."}')])) == (
+        "answer",
+        "No prices.",
+    )
+    assert _extract_steps(msg("hmm, let me think")) == ("none", "hmm, let me think")
+
+
+def test_missing_prerequisites_are_filled_from_policy(master) -> None:  # noqa: ANN001
+    from ward.master import _complete_plan, _normalize_steps
+
+    gw, me = master
+    caps = gw.capabilities(me("capabilities"))
+    lonely = [
+        {
+            "tool": "draft_order",
+            "args": {"patient_id": "P003", "drug": "doxycycline", "daily_dose_mg": 200},
+        }
+    ]
+    steps, added = _complete_plan(_normalize_steps(lonely, caps), caps, [])
+    tools = [s["tool"] for s in steps]
+    assert tools[-1] == "draft_order" and added == 5
+    assert tools.index("get_active_medications") < tools.index("check_interactions")
+    run_id = gw.start_run(me("start_run"), "t")
+    plan = gw.declare_plan(me("declare_plan"), run_id, steps)  # the gateway accepts it
+    assert len(plan["leases"]) == 6
+
+
+def test_a_wrong_agent_is_not_silently_fixed(master) -> None:  # noqa: ANN001
+    from ward.master import _normalize_steps
+
+    gw, me = master
+    caps = gw.capabilities(me("capabilities"))
+    wrong = [{"agent": "PharmacyAgent", "tool": "get_allergies", "args": {"patient_id": "P002"}}]
+    assert _normalize_steps(wrong, caps)[0]["agent"] == "PharmacyAgent"
+
+
+def test_few_shot_examples_are_valid_under_the_policy(gw: Gateway) -> None:
+    """Every worked example in the policy file must pass the gateway as written."""
+    examples = CFG.master["few_shot"]
+    assert examples
+    for ex in examples:
+        turns = [plan_turn(p) for p in ex.get("plans", [])]
+        if "answer" in ex:
+            turns = [msg(calls=[("answer_directly", json.dumps({"answer": ex["answer"]}))])]
+        agent = MasterAgent(
+            gw, FakeLLM(turns + [done_turn(), text_turn("ok")]), "fake", sleep=lambda s: None
+        )
+        run_id = agent.handle(ex["request"])
+        row = gw.conn.execute(
+            "SELECT status, plans FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        assert row["status"] == "done", ex["request"]
+        assert row["plans"] == len(ex.get("plans", [])), ex["request"]
+
+
+def test_a_nudge_rescues_a_prose_reply(gw: Gateway) -> None:
+    llm = FakeLLM(
+        [
+            text_turn("Sure! I'd check the kidneys."),
+            plan_turn(
+                [
+                    {
+                        "agent": "LabsAgent",
+                        "tool": "get_renal_function",
+                        "args": {"patient_id": "P004"},
+                    }
+                ]
+            ),
+            done_turn(),
+            text_turn("Severe."),
+        ]
+    )
+    run_id = MasterAgent(gw, llm, "fake", sleep=lambda s: None).handle("P004 kidneys?")
+    assert (
+        gw.conn.execute("SELECT answer FROM runs WHERE run_id = ?", (run_id,)).fetchone()[0]
+        == "Severe."
+    )
+    raw = [e for e in gw.snapshot()["audit"] if e["kind"] == "PROGRESS" and e["detail"]]
+    assert "check the kidneys" in raw[0]["detail"]["raw_model_reply"]
+
+
+def test_rejected_plans_do_not_burn_the_masters_badge(master) -> None:  # noqa: ANN001
+    gw, me = master
+    run_id = gw.start_run(me("start_run"), "t")
+    bad = [{"agent": "LabsAgent", "tool": "get_renal_function", "args": {"patient_id": "nope"}}]
+    for _ in range(3):
+        with pytest.raises(Denied):
+            gw.declare_plan(me("declare_plan"), run_id, bad)
+    gw.check_badge(me.token)  # still valid
+
+
+def test_ollama_native_client_sets_the_context_window() -> None:
+    import httpx
+
+    from ward.llm import OllamaNative
+
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "declare_plan", "arguments": {"steps": [STEP]}}}
+                    ],
+                }
+            },
+        )
+
+    client = OllamaNative("http://ollama:11434/v1", num_ctx=8192)
+    client._http = httpx.Client(
+        base_url="http://ollama:11434", transport=httpx.MockTransport(handler)
+    )  # noqa: SLF001
+    reply = client.chat.completions.create(
+        model="m",
+        messages=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "x",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": '{"a": 1}'},
+                    }
+                ],
+            }
+        ],
+    )
+    assert seen["options"]["num_ctx"] == 8192 and seen["stream"] is False
+    assert seen["messages"][0]["tool_calls"][0]["function"]["arguments"] == {"a": 1}
+    call = reply.choices[0].message.tool_calls[0]
+    assert call.function.name == "declare_plan" and json.loads(call.function.arguments)["steps"]

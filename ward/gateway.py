@@ -409,8 +409,14 @@ class Gateway:
         detail: str,
         run_id: str | None,
         tool: str | None = None,
+        count: bool = True,
     ) -> None:
-        """Audit a denial, apply its consequences, and raise."""
+        """Audit a denial, apply its consequences, and raise.
+
+        `count=False` is for a rejected plan: nothing ran, the plan budget per run already
+        caps retries, and a model's honest mistake shouldn't burn its badge. Policy
+        violations (wrong role, lease misuse, off-plan calls) still count.
+        """
         actor = badge.agent_id if badge else None
         with self.lock:
             self._audit(
@@ -423,17 +429,19 @@ class Gateway:
                 actor=actor,
                 detail={"tool": tool} if tool else {},
             )
-            if badge is not None:
+            if badge is not None and (count or reason in REVOKE_NOW):
                 self.conn.execute(
                     "UPDATE badges SET denied = denied + 1 WHERE jti = ?", (badge.jti,)
                 )
-                count = self.conn.execute(
+                denied_total = self.conn.execute(
                     "SELECT denied FROM badges WHERE jti = ?", (badge.jti,)
                 ).fetchone()[0]
                 if reason in REVOKE_NOW:
                     self.revoke(badge.agent_id, "gateway", f"{reason} is a revoking offense")
-                elif count >= int(self.config.run["max_denied_calls_per_badge"]):
-                    self.revoke(badge.agent_id, "gateway", f"{count} denied calls on one badge")
+                elif denied_total >= int(self.config.run["max_denied_calls_per_badge"]):
+                    self.revoke(
+                        badge.agent_id, "gateway", f"{denied_total} denied calls on one badge"
+                    )
         raise Denied(reason, detail)
 
     # ---- revocation ----------------------------------------------------------------------
@@ -513,7 +521,9 @@ class Gateway:
             self._denied(master, "DENY_RUN_ENDED", f"run is {run['status']}", run_id)
         return run
 
-    def report_progress(self, cred: Credential, run_id: str, what: str) -> None:
+    def report_progress(
+        self, cred: Credential, run_id: str, what: str, raw: str | None = None
+    ) -> None:
         master = self._master(cred, "report_progress")
         with self.lock:
             self._run(run_id, master)
@@ -521,7 +531,11 @@ class Gateway:
                 "UPDATE runs SET last_progress_ms = ? WHERE run_id = ?", (now_ms(), run_id)
             )
             self._audit(
-                "PROGRESS", f"{master.agent_id}: {what}", run_id=run_id, actor=master.agent_id
+                "PROGRESS",
+                f"{master.agent_id}: {what}",
+                run_id=run_id,
+                actor=master.agent_id,
+                detail={"raw_model_reply": raw} if raw else None,
             )
 
     def heartbeat(self, cred: Credential, run_id: str) -> dict[str, Any]:
@@ -652,7 +666,7 @@ class Gateway:
                         now_ms(),
                     ),
                 )
-                self._denied(master, reason, f"plan rejected: {detail}", run_id)
+                self._denied(master, reason, f"plan rejected: {detail}", run_id, count=False)
             expires = now_ms() + int(self.config.run["plan_ttl_seconds"]) * 1000
             leases = []
             for index, step in enumerate(steps):

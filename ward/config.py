@@ -81,6 +81,7 @@ class WardConfig:
     vocab: dict[str, tuple[str, ...]]
     allergy_blocks: dict[str, tuple[str, ...]]
     injection_patterns: tuple[re.Pattern[str], ...] = field(default=())
+    master: dict[str, Any] = field(default_factory=dict)
 
     @property
     def master_role(self) -> str:
@@ -197,6 +198,7 @@ def load_config(path: Path | str = DEFAULT_PATH) -> WardConfig:
         tools=tools,
         vocab=vocab,
         allergy_blocks={k: tuple(v) for k, v in raw.get("allergy_blocks", {}).items()},
+        master=dict(raw.get("master", {})),
         injection_patterns=tuple(
             re.compile(p, re.MULTILINE) for p in raw["scanners"]["injection_patterns"]
         ),

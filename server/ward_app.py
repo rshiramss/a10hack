@@ -56,14 +56,13 @@ def parse_operators(raw: str) -> dict[str, str]:
     return out
 
 
-def default_llm() -> tuple[Any, str, str]:
-    """(client, model, problem-or-empty) for the configured OpenAI-compatible backend."""
-    from openai import OpenAI
+def default_llm(config: WardConfig) -> tuple[Any, str, str]:
+    """(client, model, problem-or-empty) for the configured backend."""
+    from agents.runner import check_llm_ready
+    from ward.llm import make_llm
 
-    from agents.runner import check_llm_ready, llm_settings
-
-    _, base_url, api_key, model = llm_settings()
-    return OpenAI(base_url=base_url, api_key=api_key, timeout=90), model, check_llm_ready() or ""
+    client, model = make_llm(num_ctx=int(config.master.get("num_ctx", 8192)))
+    return client, model, check_llm_ready() or ""
 
 
 class Console:
@@ -110,7 +109,7 @@ def create_app(
     )
     llm_problem = ""
     if llm is None:
-        llm, model, llm_problem = default_llm()
+        llm, model, llm_problem = default_llm(config)
     console = Console(config, llm, model or "fake", sleep=sleep)
     sessions: dict[str, str] = {}
 

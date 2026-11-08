@@ -8,6 +8,7 @@ policy file at run time (`gateway.capabilities`), not from this code.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
@@ -76,12 +77,17 @@ Rules for plans:
 Available consults (from policy):
 {capabilities}
 
-Example of the plan format (values are illustrative):
+Worked examples (other patients and drugs; copy the format, not the content):
 {example}
 
 Call declare_plan with your steps. Call answer_directly instead if the request needs no
 patient or drug facts, or if no listed tool can provide what's asked: then say plainly which
 information isn't available through the specialists."""
+
+NUDGE = (
+    "Reply by calling a tool: declare_plan with your steps, or answer_directly with one "
+    "sentence saying what information the specialists can't provide."
+)
 
 FOLLOW_UP = """Typed results so far:
 {results}
@@ -128,43 +134,195 @@ def _example_plan(caps: list[dict[str, Any]]) -> str:
     return json.dumps({"steps": steps})
 
 
-def _capabilities_text(caps: list[dict[str, Any]]) -> str:
-    """Policy capabilities grouped by agent, so a small model pairs tools with owners."""
+def _capabilities_text(caps: list[dict[str, Any]], vocab: dict[str, tuple[str, ...]]) -> str:
+    """Policy capabilities grouped by agent, so a small model pairs tools with owners.
+    Each list of allowed values is printed once and referenced by name, which keeps the
+    prompt short."""
+    names = {"one of: " + ", ".join(values): name for name, values in vocab.items()}
+    used: set[str] = set()
+
+    def short(desc: str) -> str:
+        for full, name in names.items():
+            if full in desc:
+                used.add(name)
+                desc = desc.replace(full, f"a <{name}>")
+        return desc
+
     lines: list[str] = []
     for agent in dict.fromkeys(c["agent"] for c in caps):
         lines.append(f"{agent} (only this agent can run these tools):")
         for c in (c for c in caps if c["agent"] == agent):
-            args = ", ".join(f"{a}: {d}" for a, d in c["args"].items())
-            line = f"  - {c['tool']}({args}) — {c['description']}"
+            args = ", ".join(f"{a}: {short(d)}" for a, d in c["args"].items())
+            line = f"  - {c['tool']}({args}): {c['description']}"
             if c["needs_earlier_steps"]:
                 line += f" Needs earlier steps: {', '.join(c['needs_earlier_steps'])}."
             if c["uses_if_present"]:
                 line += f" Uses if present: {', '.join(c['uses_if_present'])}."
-            lines.append(line + f" Returns {json.dumps(c['returns'])}")
+            returns = ", ".join(f"{f}: {short(d)}" for f, d in c["returns"].items())
+            lines.append(line + f" Returns {{{returns}}}.")
+    lines.append("Allowed values:")
+    for name in sorted(used):
+        lines.append(f"  <{name}>: {', '.join(vocab[name])}")
     return "\n".join(lines)
 
 
-def _extract_steps(message: Any) -> tuple[str, Any]:
-    """('plan', steps) | ('answer', text) | ('none', text). Tolerates models that put JSON
-    in the content instead of making a tool call."""
-    calls = list(getattr(message, "tool_calls", None) or [])
-    for call in calls:
+def _few_shot_text(examples: list[dict[str, Any]]) -> str:
+    """Worked examples from the policy file, rendered as text."""
+    out = []
+    for i, ex in enumerate(examples, start=1):
+        out.append(f'Example {i}. Request: "{ex["request"]}"')
+        for j, plan in enumerate(ex.get("plans", [])):
+            if j and ex.get("between"):
+                out.append(f"  ({ex['between']})")
+            prefix = "  then declare_plan" if j else "  declare_plan"
+            out.append(f"{prefix} {json.dumps({'steps': plan})}")
+        if "answer" in ex:
+            out.append(f"  answer_directly {json.dumps({'answer': ex['answer']})}")
+    return "\n".join(out)
+
+
+def _raw_reply(message: Any) -> str:
+    calls = [
+        f"{c.function.name}({c.function.arguments})"
+        for c in (getattr(message, "tool_calls", None) or [])
+    ]
+    return ((getattr(message, "content", "") or "") + " " + " ".join(calls)).strip()[:600]
+
+
+def _json_candidates(text: str) -> list[Any]:
+    """Every JSON value we can find in a model's text: the whole thing, fenced blocks,
+    <tool_call> blocks, and balanced {...} / [...] spans."""
+    found: list[Any] = []
+    chunks = [text]
+    chunks += re.findall(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    chunks += re.findall(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", text, re.DOTALL)
+    for chunk in chunks:
         try:
-            args = json.loads(call.function.arguments or "{}")
-        except json.JSONDecodeError:
-            args = {}
-        if call.function.name == "declare_plan":
-            return "plan", args.get("steps", args if isinstance(args, list) else [])
-        if call.function.name == "answer_directly":
-            return "answer", str(args.get("answer", ""))
-    content = getattr(message, "content", "") or ""
-    match = re.search(r"\{.*\"steps\".*\}", content, re.DOTALL)
-    if match:
-        try:
-            return "plan", json.loads(match.group(0))["steps"]
-        except (json.JSONDecodeError, KeyError, TypeError):
+            found.append(json.loads(chunk))
+            continue
+        except (json.JSONDecodeError, TypeError):
             pass
+        for opener, closer in (("{", "}"), ("[", "]")):
+            depth, begin = 0, None
+            for i, ch in enumerate(chunk):
+                if ch == opener:
+                    if depth == 0:
+                        begin = i
+                    depth += 1
+                elif ch == closer and depth:
+                    depth -= 1
+                    if depth == 0 and begin is not None:
+                        with contextlib.suppress(json.JSONDecodeError):
+                            found.append(json.loads(chunk[begin : i + 1]))
+    return found
+
+
+def _interpret(value: Any, name: str | None = None) -> tuple[str, Any] | None:
+    """Recognize a plan or a direct answer in the shapes small models produce."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return ("answer", value) if name == "answer_directly" else None
+    is_steps = isinstance(value, list) and value and all(isinstance(v, dict) for v in value)
+    if is_steps and any("tool" in v or "function" in v for v in value):
+        return "plan", value
+    if not isinstance(value, dict):
+        return None
+    if name == "answer_directly" or ("answer" in value and len(value) == 1):
+        return "answer", str(value.get("answer", ""))
+    if "steps" in value:
+        return "plan", value["steps"]
+    call_name = value.get("name") or value.get("function")
+    inner = value.get("arguments", value.get("parameters"))
+    if isinstance(call_name, str) and inner is not None:
+        return _interpret(inner, call_name)
+    if "tool" in value:
+        return "plan", [value]
+    return None
+
+
+def _extract_steps(message: Any) -> tuple[str, Any]:
+    """('plan', steps) | ('answer', text) | ('none', raw text)."""
+    for call in list(getattr(message, "tool_calls", None) or []):
+        result = _interpret(call.function.arguments or "{}", call.function.name)
+        if result:
+            return result
+    content = getattr(message, "content", "") or ""
+    for value in _json_candidates(content):
+        result = _interpret(value)
+        if result:
+            return result
     return "none", content
+
+
+def _normalize_steps(steps: Any, caps: list[dict[str, Any]]) -> Any:
+    """Common key spellings -> {agent, tool, args}; fill a missing agent with the tool's
+    owner from policy. A wrong agent is left as is, for the gateway to reject."""
+    if not isinstance(steps, list):
+        return steps
+    owners = {c["tool"]: c["agent"] for c in caps}
+    out = []
+    for step in steps:
+        if not isinstance(step, dict):
+            out.append(step)
+            continue
+        tool = step.get("tool") or step.get("name") or step.get("function")
+        agent = step.get("agent") or step.get("agent_name") or step.get("role") or owners.get(tool)
+        args = step.get("args", step.get("arguments", step.get("parameters", {})))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        out.append({"agent": agent, "tool": tool, "args": args if isinstance(args, dict) else {}})
+    return out
+
+
+def _complete_plan(
+    steps: Any, caps: list[dict[str, Any]], done: list[tuple[str, dict[str, Any]]]
+) -> tuple[Any, int]:
+    """Insert missing prerequisite steps, derived from policy, with args taken from the
+    step that needs them. Returns (steps, number added). The master's own planning aid;
+    the gateway still validates the whole plan."""
+    if not isinstance(steps, list) or not all(isinstance(s, dict) for s in steps):
+        return steps, 0
+    by_tool = {c["tool"]: c for c in caps}
+    produced = list(done)
+    out: list[dict[str, Any]] = []
+    added = 0
+
+    def have(tool: str, args: dict[str, Any]) -> bool:
+        return any(
+            t == tool and all(a[k] == args[k] for k in set(a) & set(args)) for t, a in produced
+        )
+
+    def ensure(step: dict[str, Any], depth: int = 0, inserted: bool = False) -> None:
+        nonlocal added
+        cap = by_tool.get(step.get("tool"))
+        if cap and depth < 4 and isinstance(step.get("args"), dict):
+            for source in cap["needs_earlier_steps"] + cap["uses_if_present"]:
+                if source not in by_tool or have(source, step["args"]):
+                    continue
+                needed = list(by_tool[source]["args"])
+                if not all(a in step["args"] for a in needed):
+                    continue  # can't derive its args; the gateway will explain
+                pre = {
+                    "agent": by_tool[source]["agent"],
+                    "tool": source,
+                    "args": {a: step["args"][a] for a in needed},
+                }
+                ensure(pre, depth + 1, inserted=True)
+        if step not in out:
+            out.append(step)
+            if isinstance(step.get("args"), dict):
+                produced.append((step.get("tool"), step["args"]))
+            if inserted:
+                added += 1
+
+    for step in steps:
+        ensure(step)
+    return out, added
 
 
 class MasterAgent:
@@ -238,7 +396,7 @@ class MasterAgent:
             "model": self.model,
             "messages": messages,
             "temperature": 0,
-            "max_tokens": 900,
+            "max_tokens": int(self.gw.config.master.get("max_tokens", 900)),
         }
         if tools:
             kwargs["tools"] = tools
@@ -248,8 +406,9 @@ class MasterAgent:
         caps = self.gw.capabilities(self._cred("capabilities"))
         max_plans = int(self.gw.config.run["max_plans_per_run"])
         system = PLANNER_PROMPT.format(
-            capabilities=_capabilities_text(caps),
-            example=_example_plan(caps),
+            capabilities=_capabilities_text(caps, self.gw.config.vocab),
+            example=_few_shot_text(self.gw.config.master.get("few_shot", []))
+            or _example_plan(caps),
             max_plans=max_plans,
         )
         messages: list[dict[str, Any]] = [
@@ -258,15 +417,38 @@ class MasterAgent:
         ]
         results: list[dict[str, Any]] = []
         plans_used = 0
+        nudges = 0
+        done: list[tuple[str, dict[str, Any]]] = []
         must_replan = False
         while plans_used < max_plans:
             # After a rejected plan the model must fix it: answer_directly isn't offered.
             tools = [PLAN_TOOL] if must_replan else [PLAN_TOOL, NO_CONSULT_TOOL]
             message = self._chat(messages, tools)
-            must_replan = False
             kind, payload = _extract_steps(message)
+            if kind == "none" and nudges < 1 and not results:
+                # One nudge before giving up: small models sometimes reply in prose.
+                nudges += 1
+                self.gw.report_progress(
+                    self._cred("report_progress"),
+                    run_id,
+                    "unusable reply, nudged once",
+                    raw=_raw_reply(message),
+                )
+                messages.append({"role": "assistant", "content": message.content or ""})
+                messages.append({"role": "user", "content": NUDGE})
+                continue
+            must_replan = False
+            added = 0
+            if kind == "plan":
+                payload, added = _complete_plan(_normalize_steps(payload, caps), caps, done)
+            label = "planned" if kind == "plan" else "replied"
+            if added:
+                label += f" (+{added} prerequisite step{'s' * (added > 1)} filled in from policy)"
             self.gw.report_progress(
-                self._cred("report_progress"), run_id, "planned" if kind == "plan" else "replied"
+                self._cred("report_progress"),
+                run_id,
+                label,
+                raw=None if kind == "plan" else _raw_reply(message),
             )
             if kind != "plan":
                 if results:
@@ -300,6 +482,7 @@ class MasterAgent:
                 continue
             new = self._execute(token, run_id, plan, fault)
             results.extend(new)
+            done.extend((r["tool"], r["args"]) for r in new if r["status"] == "ok")
             if plans_used >= max_plans or any(r["status"] != "ok" for r in new):
                 break
             messages.append(

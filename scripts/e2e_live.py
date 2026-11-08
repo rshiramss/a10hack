@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agents.runner import check_llm_ready, llm_settings
+from agents.runner import check_llm_ready
 from ward.config import load_config
 from ward.data import INJECTION
 from ward.gateway import Gateway
@@ -509,10 +509,10 @@ def main() -> int:
     if problem:
         print(f"LLM not ready: {problem}")
         return 2
-    from openai import OpenAI
+    from ward.llm import make_llm
 
-    _, base_url, api_key, model = llm_settings()
-    llm = RecordingLLM(OpenAI(base_url=base_url, api_key=api_key, timeout=120))
+    client, model = make_llm(num_ctx=int(load_config().master.get("num_ctx", 8192)))
+    llm = RecordingLLM(client)
     chosen = [s for s in scenarios() if not args.only or s.key in args.only.split(",")]
 
     rows, transcripts, security_failures = [], [], 0
