@@ -187,9 +187,12 @@ function renderRun(snap) {
 
   const items = [];
   for (const plan of run.plans) {
+    const n = run.plans.length > 1 ? `Plan ${plan.seq} of ${run.plans.length} · ` : "";
     items.push(el("li", { class: `plan-label ${plan.status}`,
-      text: plan.status === "approved" ? `${plan.plan_id} · approved`
-        : `${plan.plan_id} · rejected by the gateway: ${human(plan.reason)} — ${plan.detail}` }));
+      text: plan.status === "approved"
+        ? `${n}${plan.plan_id} · approved, its steps ran:`
+        : `${n}${plan.plan_id} · rejected by the gateway, nothing in it ran (${human(plan.reason)}: ${plan.detail})`
+          + (plan.seq < run.plans.length ? " — the master sent a corrected plan" : "") }));
     run.steps.filter((s) => s.plan_id === plan.plan_id).forEach((step) => {
       const kinds = leaseEvents(step.lease_id);
       const chip = (label, on, bad) => el("span", { class: `hs ${bad ? "bad" : on ? "on" : ""}`, text: label });
