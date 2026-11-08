@@ -836,3 +836,92 @@ def test_rate_limited_model_falls_back_to_the_next_one() -> None:
     assert client.chat.completions.create(model="openai/gpt-oss-120b", max_tokens=900) == "ok"
     assert calls == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
     assert client.last_model == "openai/gpt-oss-20b"
+
+
+# ---- the extra agents ----------------------------------------------------------------------
+
+
+def step(agent: str, tool: str, **args: Any) -> dict[str, Any]:
+    return {"agent": agent, "tool": tool, "args": args}
+
+
+def test_discharge_readiness_uses_piped_vitals_and_labs(master) -> None:  # noqa: ANN001
+    gw, me = master
+    _, results = run_plan(
+        gw,
+        me,
+        [
+            step("VitalsAgent", "get_vitals", patient_id="P004"),
+            step("LabsAgent", "get_latest_labs", patient_id="P004"),
+            step("DischargeAgent", "check_discharge_readiness", patient_id="P004"),
+            step("CareTeamAgent", "get_care_team", patient_id="P004"),
+        ],
+    )
+    discharge = results[2]["result"]
+    assert discharge["ready"] is False
+    assert set(discharge["blockers"]) == {"low_oxygen", "abnormal_potassium", "tachycardia"}
+    assert results[3]["result"]["nurse"] == "RN-304"
+
+
+def test_discharge_needs_vitals_and_labs_first(master) -> None:  # noqa: ANN001
+    gw, me = master
+    run_id = gw.start_run(me("start_run"), "t")
+    with pytest.raises(Denied, match="DENY_PRECONDITION"):
+        gw.declare_plan(
+            me("declare_plan"),
+            run_id,
+            [step("DischargeAgent", "check_discharge_readiness", patient_id="P006")],
+        )
+
+
+def test_find_then_book_an_appointment_across_two_plans(master) -> None:  # noqa: ANN001
+    gw, me = master
+    run_id = gw.start_run(me("start_run"), "t")
+    plan = gw.declare_plan(
+        me("declare_plan"),
+        run_id,
+        [step("SchedulingAgent", "find_appointment_slots", specialty="cardiology", within_days=7)],
+    )
+    slots = gw.consult(me("consult"), plan["leases"][0]["lease_id"])["result"]["slots"]
+    assert slots == ["SLOT-CAR-021", "SLOT-CAR-052"]
+    plan = gw.declare_plan(
+        me("declare_plan"),
+        run_id,
+        [step("SchedulingAgent", "book_appointment", patient_id="P005", slot_id=slots[0])],
+    )
+    booked = gw.consult(me("consult"), plan["leases"][0]["lease_id"])["result"]
+    assert booked["booked"] and booked["appointment_id"].startswith("APT-")
+
+
+def test_other_new_tools(master) -> None:  # noqa: ANN001
+    gw, me = master
+    _, r = run_plan(
+        gw,
+        me,
+        [
+            step("RegistrationAgent", "get_patient_profile", patient_id="P008"),
+            step("MedHistoryAgent", "get_problem_list", patient_id="P008"),
+            step("ImagingAgent", "get_imaging_results", patient_id="P008"),
+            step("PharmacyAgent", "check_stock", drug="azithromycin"),
+            step("InsuranceAgent", "request_prior_auth", patient_id="P004", drug="apixaban"),
+            step("LabsAgent", "order_lab", patient_id="P008", test="cbc", urgency="stat"),
+            step(
+                "CareTeamAgent",
+                "page_clinician",
+                patient_id="P008",
+                clinician="DR-204",
+                urgency="urgent",
+            ),
+        ],
+    )
+    assert r[0]["result"] == {"age": 83, "insurance_plan": "standard", "primary_care": "DR-104"}
+    assert "copd" in r[1]["result"]["conditions"]
+    assert "pneumonia" in r[2]["result"]["findings"]
+    assert r[3]["result"] == {"in_stock": False, "units": 0}
+    assert r[4]["result"]["status"] == "pending_review"
+    assert r[5]["result"]["eta_hours"] == 1
+    assert r[6]["result"]["paged"] is True
+
+
+def test_every_role_has_an_attested_build(gw: Gateway) -> None:
+    assert set(gw.expected_measurements) == set(CFG.roles)
