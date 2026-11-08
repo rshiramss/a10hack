@@ -27,7 +27,7 @@ from typing import Any
 import jwt
 
 from ward import crypto
-from ward.attestation import master_functions, measure
+from ward.attestation import badge_agent_path, master_functions, measure, measure_source_file
 from ward.config import WardConfig
 from ward.data import seed_clinical
 from ward.specialist import OfferRefused, SpecialistInstance
@@ -139,8 +139,13 @@ class Gateway:
         self.expected_measurements[config.master_role] = measure(
             config.master_role, config, master_functions()
         )
+        # External MCP clients attest as the badge_agent source file.
+        external_measurement = measure_source_file(badge_agent_path())
+        for role in config.external_roles():
+            self.expected_measurements[role.name] = external_measurement
         self._counters: dict[str, int] = {}
         self._instances: dict[str, SpecialistInstance] = {}
+        self._mcp_runs: dict[str, str] = {}  # agent_id -> durable MCP session run_id
 
     # ---- audit -------------------------------------------------------------------------
 
@@ -476,8 +481,17 @@ class Gateway:
     def _master(self, cred: Credential, op: str) -> Badge:
         badge = self.verify(cred, op)
         if badge.role != self.config.master_role:
-            self._denied(badge, "DENY_NOT_MASTER", "only the master agent may delegate", None)
+            self._denied(badge, "DENY_NOT_MASTER", "only the master agent may do this", None)
         return badge
+
+    def _delegator(self, cred: Credential, op: str) -> Badge:
+        """Master or an external role with may_delegate. Specialists cannot declare/consult."""
+        badge = self.verify(cred, op)
+        role = self.config.roles[badge.role]
+        if role.master or role.may_delegate:
+            return badge
+        self._denied(badge, "DENY_NOT_MASTER", "only a delegating role may call specialists", None)
+        raise AssertionError  # pragma: no cover — _denied always raises
 
     def _denied(
         self,
@@ -549,12 +563,12 @@ class Gateway:
                 target=agent_id,
                 run_id=agent["run_id"],
             )
-            if agent["role"] == self.config.master_role:
-                for run in self.conn.execute(
-                    "SELECT run_id FROM runs WHERE master_id = ? AND status = 'running'",
-                    (agent_id,),
-                ).fetchall():
-                    self._end_run(run["run_id"], "aborted", error=f"master revoked: {why}")
+            for run in self.conn.execute(
+                "SELECT run_id FROM runs WHERE master_id = ? AND status = 'running'",
+                (agent_id,),
+            ).fetchall():
+                self._end_run(run["run_id"], "aborted", error=f"caller revoked: {why}")
+            self._mcp_runs.pop(agent_id, None)
             return True
 
     # ---- runs ------------------------------------------------------------------------------
@@ -564,7 +578,10 @@ class Gateway:
         run_id = "RUN-" + uuid.uuid4().hex[:6].upper()
         flagged = any(p.search(prompt) for p in self.config.injection_patterns)
         with self.lock:
-            busy = self.conn.execute("SELECT 1 FROM runs WHERE status = 'running'").fetchone()
+            # MCP session runs (prompt starts with [mcp]) don't block the chat master.
+            busy = self.conn.execute(
+                "SELECT 1 FROM runs WHERE status = 'running' AND prompt NOT LIKE '[mcp]%'"
+            ).fetchone()
             if busy:
                 raise Denied("DENY_BUSY", "a run is already in progress")
             self.conn.execute(
@@ -589,6 +606,71 @@ class Gateway:
                     run_id=run_id,
                 )
         return run_id
+
+    # ---- MCP external sessions --------------------------------------------------------------
+
+    def _require_external(self, badge: Badge) -> None:
+        if not self.config.roles[badge.role].external:
+            raise Denied("DENY_NOT_EXTERNAL", "MCP is for external roles")
+
+    def ensure_mcp_run_as(self, badge: Badge) -> str:
+        """Durable per-identity MCP session run so prerequisites accumulate across calls.
+
+        Caller must already have verified PoP for the MCP front-door op.
+        """
+        self._require_external(badge)
+        with self.lock:
+            existing = self._mcp_runs.get(badge.agent_id)
+            if existing:
+                row = self.conn.execute(
+                    "SELECT status FROM runs WHERE run_id = ?", (existing,)
+                ).fetchone()
+                if row and row["status"] == "running":
+                    return existing
+            run_id = "MCP-" + uuid.uuid4().hex[:6].upper()
+            self.conn.execute(
+                "INSERT INTO runs (run_id, master_id, prompt, status, created_ms, last_progress_ms,"
+                " flagged) VALUES (?, ?, ?, 'running', ?, ?, 0)",
+                (run_id, badge.agent_id, f"[mcp] {badge.agent_id}", now_ms(), now_ms()),
+            )
+            self._mcp_runs[badge.agent_id] = run_id
+            self._audit(
+                "RUN_STARTED",
+                f"{badge.agent_id} opened an MCP session",
+                run_id=run_id,
+                actor=badge.agent_id,
+                detail={"mcp": True},
+            )
+            return run_id
+
+    def mcp_list_tools_as(self, badge: Badge) -> list[dict[str, Any]]:
+        self._require_external(badge)
+        return self._capabilities_for(badge.role)
+
+    def mcp_call_tool_as(self, badge: Badge, tool: str, args: Any) -> dict[str, Any]:
+        """One MCP tools/call after front-door PoP: one-step plan + consult."""
+        self._require_external(badge)
+        if not isinstance(args, dict):
+            raise Denied("DENY_SCHEMA", "arguments must be an object")
+        owner = self.config.owner_role(tool)
+        if owner is None or not self.config.roles[badge.role].allows_tool(tool):
+            with self.lock:
+                self._denied(
+                    badge,
+                    "DENY_ROLE_FORBIDDEN",
+                    f"{self.config.roles[badge.role].display_name} may not call {str(tool)[:40]!r}",
+                    self._mcp_runs.get(badge.agent_id),
+                    tool if isinstance(tool, str) else None,
+                )
+        run_id = self.ensure_mcp_run_as(badge)
+        step = {
+            "agent": self.config.roles[owner].display_name,
+            "tool": tool,
+            "args": args,
+        }
+        plan = self._declare_plan_as(badge, run_id, [step])
+        lease_id = plan["leases"][0]["lease_id"]
+        return self._consult_as(badge, lease_id)
 
     def _run(self, run_id: str, master: Badge) -> sqlite3.Row:
         run = self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
@@ -692,13 +774,19 @@ class Gateway:
     # ---- capabilities ----------------------------------------------------------------------
 
     def capabilities(self, cred: Credential) -> list[dict[str, Any]]:
-        """What the master may delegate, straight from policy. Filtered by callable_by."""
-        master = self._master(cred, "capabilities")
+        """What a delegator may call, straight from policy. Filtered by callable_by + allowlist."""
+        caller = self._delegator(cred, "capabilities")
+        return self._capabilities_for(caller.role)
+
+    def _capabilities_for(self, caller_role: str) -> list[dict[str, Any]]:
+        caller = self.config.roles[caller_role]
         out = []
         for role in self.config.specialists():
-            if master.role not in role.callable_by:
+            if caller_role not in role.callable_by:
                 continue
             for name in role.tools:
+                if not caller.allows_tool(name):
+                    continue
                 tool = self.config.tools[name]
                 out.append(
                     {
@@ -720,12 +808,20 @@ class Gateway:
     # ---- plans and leases -------------------------------------------------------------------
 
     def declare_plan(self, cred: Credential, run_id: str, steps: Any) -> dict[str, Any]:
-        master = self._master(cred, "declare_plan")
+        return self._declare_plan_as(self._delegator(cred, "declare_plan"), run_id, steps)
+
+    def _declare_plan_as(self, caller: Badge, run_id: str, steps: Any) -> dict[str, Any]:
         with self.lock:
-            run = self._run(run_id, master)
-            if run["plans"] >= int(self.config.run["max_plans_per_run"]):
-                self._denied(master, "DENY_REPLAN_LIMIT", "no more plans this run", run_id)
-            problem = self._validate_plan(run_id, steps)
+            run = self._run(run_id, caller)
+            limit_key = (
+                "mcp_max_plans_per_run"
+                if run["prompt"].startswith("[mcp]")
+                else "max_plans_per_run"
+            )
+            limit = int(self.config.run.get(limit_key, self.config.run["max_plans_per_run"]))
+            if run["plans"] >= limit:
+                self._denied(caller, "DENY_REPLAN_LIMIT", "no more plans this run", run_id)
+            problem = self._validate_plan(run_id, steps, caller.role)
             plan_id = "PLAN-" + uuid.uuid4().hex[:6].upper()
             seq = run["plans"] + 1
             self.conn.execute("UPDATE runs SET plans = plans + 1 WHERE run_id = ?", (run_id,))
@@ -743,7 +839,8 @@ class Gateway:
                         now_ms(),
                     ),
                 )
-                self._denied(master, reason, f"plan rejected: {detail}", run_id, count=False)
+                # Role overreach revokes via REVOKE_NOW; honest plan mistakes do not count.
+                self._denied(caller, reason, f"plan rejected: {detail}", run_id, count=False)
             expires = now_ms() + int(self.config.run["plan_ttl_seconds"]) * 1000
             leases = []
             for index, step in enumerate(steps):
@@ -784,13 +881,14 @@ class Gateway:
                 f"{len(steps)} single-use lease{'s' * (len(steps) != 1)}",
                 decision="ALLOW",
                 run_id=run_id,
-                actor=master.agent_id,
+                actor=caller.agent_id,
                 detail={"plan_id": plan_id, "steps": [f"{s['agent']}.{s['tool']}" for s in steps]},
             )
             return {"plan_id": plan_id, "leases": leases}
 
-    def _validate_plan(self, run_id: str, steps: Any) -> tuple[str, str] | None:
+    def _validate_plan(self, run_id: str, steps: Any, caller_role: str) -> tuple[str, str] | None:
         cfg = self.config
+        caller = cfg.roles[caller_role]
         if not isinstance(steps, list) or not steps:
             return "DENY_PLAN_INVALID", "a plan needs at least one step"
         if len(steps) > int(cfg.run["max_steps_per_plan"]):
@@ -810,11 +908,16 @@ class Gateway:
             if role is None:
                 return "DENY_UNKNOWN_AGENT", f"{where}: no agent called {str(step['agent'])[:40]!r}"
             spec = cfg.roles[role]
-            if spec.master:
-                return "DENY_PLAN_INVALID", f"{where}: the master can't delegate to itself"
-            if cfg.master_role not in spec.callable_by:
+            if spec.master or spec.external:
+                return "DENY_PLAN_INVALID", f"{where}: can't delegate to {spec.display_name}"
+            if caller_role not in spec.callable_by:
                 return "DENY_NOT_CALLABLE", f"{where}: {spec.display_name} won't take delegations"
             tool = step["tool"]
+            if not caller.allows_tool(str(tool)):
+                return (
+                    "DENY_ROLE_FORBIDDEN",
+                    f"{where}: {caller.display_name} may not call {str(tool)[:40]!r}",
+                )
             if tool not in spec.tools:
                 owner = cfg.tools[tool].owner if tool in cfg.tools else None
                 hint = f" (it belongs to {cfg.roles[owner].display_name})" if owner else ""
@@ -833,9 +936,11 @@ class Gateway:
                 if item.required and not self._find_source(
                     item.source_tool, step["args"], produced
                 ):
+                    needed = sorted({i.source_tool for i in cfg.tools[tool].inputs if i.required})
                     return (
                         "DENY_PRECONDITION",
-                        f"{where}: {tool} needs {item.source_tool} with matching args earlier",
+                        f"{where}: {tool} needs {item.source_tool} with matching args earlier"
+                        f" (call first: {', '.join(needed)})",
                     )
             produced.append((tool, step["args"]))
         return None
@@ -871,7 +976,9 @@ class Gateway:
     # ---- consult: the two-way handshake ---------------------------------------------------
 
     def consult(self, cred: Credential, lease_id: str) -> dict[str, Any]:
-        master = self._master(cred, "consult")
+        return self._consult_as(self._delegator(cred, "consult"), lease_id)
+
+    def _consult_as(self, caller: Badge, lease_id: str) -> dict[str, Any]:
         delay = self.settings["step_delay_ms"] / 1000
 
         # Phase A: lease checks, typed inputs, specialist instance, delegation.
@@ -881,24 +988,24 @@ class Gateway:
             ).fetchone()
             run_id = lease["run_id"] if lease else None
             if lease is None:
-                self._denied(master, "DENY_NO_LEASE", "unknown lease", None)
-            self._run(run_id, master)
+                self._denied(caller, "DENY_NO_LEASE", "unknown lease", None)
+            self._run(run_id, caller)
             if lease["status"] != "active":
                 self._denied(
-                    master, "DENY_LEASE_USED", f"lease is {lease['status']}", run_id, lease["tool"]
+                    caller, "DENY_LEASE_USED", f"lease is {lease['status']}", run_id, lease["tool"]
                 )
             if now_ms() >= lease["expires_ms"]:
                 self.conn.execute(
                     "UPDATE leases SET status = 'expired' WHERE lease_id = ?", (lease_id,)
                 )
-                self._denied(master, "DENY_LEASE_EXPIRED", "plan TTL passed", run_id, lease["tool"])
+                self._denied(caller, "DENY_LEASE_EXPIRED", "plan TTL passed", run_id, lease["tool"])
             earlier = self.conn.execute(
                 "SELECT COUNT(*) FROM leases WHERE plan_id = ? AND step_index < ? AND status = 'active'",
                 (lease["plan_id"], lease["step_index"]),
             ).fetchone()[0]
             if earlier:
                 self._denied(
-                    master,
+                    caller,
                     "DENY_OFF_PLAN",
                     "an earlier step of the plan hasn't run",
                     run_id,
@@ -909,26 +1016,26 @@ class Gateway:
                 inputs = self._gather_inputs(run_id, lease["tool"], args)
             except Denied as exc:
                 self._fail_lease(lease_id, exc.reason)
-                self._denied(master, exc.reason, exc.detail, run_id, lease["tool"])
+                self._denied(caller, exc.reason, exc.detail, run_id, lease["tool"])
             instance = self._instance_for(run_id, lease["role"])
-            offer, challenge = self._offer(master, lease, instance, args, inputs)
+            offer, challenge = self._offer(caller, lease, instance, args, inputs)
 
         self._sleep(delay / 2)  # a human can revoke either side here
 
         for attempt in (1, 2):
             # Phase B: the handshake, then the atomic tool, then output validation.
             with self.lock:
-                self._run(run_id, master)
+                self._run(run_id, caller)
                 instance, offer, challenge = self._handle_revoked_target(
-                    master, lease, instance, offer, challenge, args, inputs
+                    caller, lease, instance, offer, challenge, args, inputs
                 )
-                output = self._handshake_and_run(master, lease, instance, offer, challenge)
+                output = self._handshake_and_run(caller, lease, instance, offer, challenge)
 
             self._sleep(delay / 2)
 
             # Phase C: last re-check, then deliver.
             with self.lock:
-                self._run(run_id, master)
+                self._run(run_id, caller)
                 status = self.conn.execute(
                     "SELECT status FROM agents WHERE agent_id = ?", (instance.agent_id,)
                 ).fetchone()["status"]
@@ -944,7 +1051,7 @@ class Gateway:
                     )
                     if attempt == 1 and self.settings["replace_revoked_specialists"]:
                         instance = self._instance_for(run_id, lease["role"])
-                        offer, challenge = self._offer(master, lease, instance, args, inputs)
+                        offer, challenge = self._offer(caller, lease, instance, args, inputs)
                         continue
                     self._fail_lease(lease_id, "DENY_REVOKED")
                     raise Denied("DENY_REVOKED", f"{instance.agent_id} revoked before delivery")
@@ -958,11 +1065,11 @@ class Gateway:
                 )
                 self._audit(
                     "DELIVERED",
-                    f"{instance.agent_id} → {master.agent_id}: typed result for {lease['tool']}",
+                    f"{instance.agent_id} → {caller.agent_id}: typed result for {lease['tool']}",
                     decision="ALLOW",
                     run_id=run_id,
                     actor=instance.agent_id,
-                    target=master.agent_id,
+                    target=caller.agent_id,
                     detail={"lease": lease_id, "result": output},
                 )
                 return {"agent": instance.agent_id, "tool": lease["tool"], "result": output}
@@ -1299,6 +1406,7 @@ class Gateway:
                         "role": a["role"],
                         "role_name": role.display_name,
                         "master": role.master,
+                        "external": role.external,
                         "description": role.description,
                         "status": a["status"],
                         "run_id": a["run_id"],
@@ -1319,7 +1427,13 @@ class Gateway:
                         and a["end_reason"] is not None
                         and "attestation" in a["end_reason"],
                         "expires_in": max(0, (badge["expires_ms"] - t) // 1000) if badge else 0,
-                        "tools": list(role.tools),
+                        "tools": list(role.tools)
+                        if not role.external
+                        else list(
+                            role.tools_allowed
+                            if role.tools_allowed and role.tools_allowed != ("*",)
+                            else sorted(self.config.tools)
+                        ),
                     }
                 )
             runs = []
@@ -1406,9 +1520,20 @@ class Gateway:
                     "name": r.display_name,
                     "description": r.description,
                     "master": r.master,
-                    "tools": list(r.tools),
+                    "external": r.external,
+                    "tools": list(r.tools)
+                    if not r.external
+                    else list(
+                        r.tools_allowed
+                        if r.tools_allowed and r.tools_allowed != ("*",)
+                        else sorted(self.config.tools)
+                    ),
                 }
                 for r in self.config.roles.values()
+            ],
+            "external_roles": [
+                {"role": r.name, "name": r.display_name, "description": r.description}
+                for r in self.config.external_roles()
             ],
         }
 

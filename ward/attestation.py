@@ -38,3 +38,17 @@ def master_functions() -> dict[str, Callable[..., Any]]:
     from ward import master
 
     return {"MasterAgent": master.MasterAgent, "planner_prompt": master._capabilities_text}
+
+
+def measure_source_file(path: str | Any) -> str:
+    """SHA-256 of a source file's bytes. Used to attest the external MCP badge agent."""
+    from pathlib import Path
+
+    data = Path(path).read_bytes()
+    return hashlib.sha256(data).hexdigest()
+
+
+def badge_agent_path() -> Any:
+    from pathlib import Path
+
+    return Path(__file__).resolve().parent.parent / "scripts" / "badge_agent.py"

@@ -10,12 +10,19 @@ Operator endpoints (session cookie + X-Ward header):
   POST /api/settings {...}         watchdog seconds, step pace, replace-revoked toggle
   POST /api/rogue                  a specialist tries to call another one
   POST /api/reset                  fresh gateway, fresh agents, fresh audit log
+  POST /api/mcp/issue {role}       provision an external MCP agent; secret shown once
+
+Agent / MCP:
+  POST /api/agent/token            workload credentials -> badge
+  POST /api/agent/rotate           rotate badge + key
+  POST /mcp                        MCP Streamable HTTP (JSON)
 """
 
 from __future__ import annotations
 
 import contextlib
 import hmac
+import json
 import os
 import secrets
 import threading
@@ -25,12 +32,13 @@ from typing import Any
 
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from ward.config import DEFAULT_PATH, WardConfig, load_config
-from ward.gateway import Denied, Gateway
+from ward.gateway import Credential, Denied, Gateway
 from ward.master import MasterAgent
+from ward.mcp import handle_message, proof_op
 
 UI_DIR = Path(__file__).resolve().parent / "ward_ui"
 COOKIE = "ward_operator"
@@ -311,6 +319,131 @@ def create_app(
             c.thread.join(timeout=5)
         c.reset()
         return JSONResponse({"ok": True})
+
+    @app.post("/api/mcp/issue")
+    async def mcp_issue(request: Request) -> JSONResponse:
+        if (bad := guarded(request)) is not None:
+            return bad
+        body = await request.json()
+        role = str(body.get("role", ""))
+        if role not in {r.name for r in app.state.console.gateway.config.external_roles()}:
+            return JSONResponse({"ok": False, "reason": "UNKNOWN_ROLE"}, status_code=400)
+        agent_id, secret = app.state.console.gateway.provision(role)
+        app.state.console.gateway._audit(  # noqa: SLF001
+            "MCP_CREDENTIAL_ISSUED",
+            f"Operator {operator(request)} issued MCP credentials for {agent_id} ({role})",
+            actor=f"operator:{operator(request)}",
+            target=agent_id,
+            detail={"role": role, "secret": "shown once to operator"},
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "client_id": agent_id,
+                "secret": secret,
+                "role": role,
+                "warning": "Copy the secret now. It is not shown again.",
+            }
+        )
+
+    def _bearer(request: Request) -> str | None:
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("bearer "):
+            return header[7:].strip() or None
+        return None
+
+    @app.post("/api/agent/token")
+    async def agent_token(request: Request) -> JSONResponse:
+        body = await request.json()
+        try:
+            session = app.state.console.gateway.authenticate(
+                str(body.get("client_id", "")),
+                str(body.get("secret", "")),
+                str(body.get("public_pem", "")),
+                str(body.get("key_proof", "")),
+                str(body.get("measurement", "")),
+            )
+        except Denied as exc:
+            return JSONResponse(
+                {"ok": False, "reason": exc.reason, "detail": exc.detail}, status_code=403
+            )
+        # External agents only need the badge token + timing. Seal/proof keys stay server-side
+        # for specialist consults; never return them over this endpoint.
+        return JSONResponse(
+            {
+                "ok": True,
+                "token": session["token"],
+                "jti": session["jti"],
+                "issued_ms": session["issued_ms"],
+                "expires_ms": session["expires_ms"],
+                "rotate_after_ms": app.state.console.gateway.config.rotate_after_seconds * 1000,
+            }
+        )
+
+    @app.post("/api/agent/rotate")
+    async def agent_rotate(request: Request) -> JSONResponse:
+        token = _bearer(request)
+        proof = request.headers.get("x-badge-proof")
+        body = await request.json()
+        try:
+            session = app.state.console.gateway.rotate(
+                Credential(token or "", proof),
+                str(body.get("public_pem", "")),
+                str(body.get("key_proof", "")),
+            )
+        except Denied as exc:
+            return JSONResponse(
+                {"ok": False, "reason": exc.reason, "detail": exc.detail}, status_code=403
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "token": session["token"],
+                "jti": session["jti"],
+                "issued_ms": session["issued_ms"],
+                "expires_ms": session["expires_ms"],
+                "rotate_after_ms": app.state.console.gateway.config.rotate_after_seconds * 1000,
+            }
+        )
+
+    @app.post("/mcp")
+    async def mcp_endpoint(request: Request) -> Response:
+        try:
+            message = json.loads(await request.body())
+        except (ValueError, UnicodeDecodeError):
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+            )
+        token = _bearer(request)
+        proof = request.headers.get("x-badge-proof")
+        method = message.get("method") if isinstance(message, dict) else None
+        params = message.get("params") if isinstance(message, dict) else {}
+        if not isinstance(params, dict):
+            params = {}
+        badge = None
+        denied: Denied | None = None
+        if isinstance(method, str) and "id" in (message or {}):
+            op = proof_op(method, params)
+            try:
+                badge = app.state.console.gateway.verify(Credential(token, proof), op)
+            except Denied as exc:
+                denied = exc
+        elif isinstance(method, str):
+            # Notification: still require a valid badge when one is presented.
+            try:
+                badge = app.state.console.gateway.verify(
+                    Credential(token, proof), proof_op(method, params), revoke_on_fail=False
+                )
+            except Denied as exc:
+                denied = exc
+        reply = handle_message(message, app.state.console.gateway, badge, denied)
+        if reply.body is None:
+            return Response(status_code=202)
+        return JSONResponse(reply.body, status_code=reply.status)
+
+    @app.api_route("/mcp", methods=["GET", "DELETE"])
+    def mcp_no_stream() -> Response:
+        return Response(status_code=405, headers={"Allow": "POST"})
 
     @app.exception_handler(Denied)
     async def denied(_: Request, exc: Denied) -> JSONResponse:

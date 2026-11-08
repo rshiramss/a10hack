@@ -65,8 +65,21 @@ class RoleSpec:
     display_name: str
     description: str
     master: bool = False
+    external: bool = False
+    may_delegate: bool = False
     tools: tuple[str, ...] = ()
+    tools_allowed: tuple[str, ...] | None = None  # None = N/A; ("*",) = all tools
     callable_by: tuple[str, ...] = ()
+
+    def allows_tool(self, tool: str) -> bool:
+        """Whether this role may request `tool` via a plan / MCP call."""
+        if self.master:
+            return True  # master plans; ownership is checked on the target specialist
+        if self.tools_allowed is None:
+            return tool in self.tools
+        if self.tools_allowed == ("*",):
+            return True
+        return tool in self.tools_allowed
 
 
 @dataclass(frozen=True)
@@ -89,13 +102,20 @@ class WardConfig:
         return next(name for name, role in self.roles.items() if role.master)
 
     def specialists(self) -> list[RoleSpec]:
-        return [role for role in self.roles.values() if not role.master]
+        return [role for role in self.roles.values() if not role.master and not role.external]
+
+    def external_roles(self) -> list[RoleSpec]:
+        return [role for role in self.roles.values() if role.external]
 
     def role_for_display(self, display_name: str) -> str | None:
         for name, role in self.roles.items():
             if display_name in (role.display_name, name):
                 return name
         return None
+
+    def owner_role(self, tool: str) -> str | None:
+        spec = self.tools.get(tool)
+        return spec.owner if spec else None
 
 
 def _field(raw: Any, vocab: dict[str, tuple[str, ...]], where: str) -> FieldSpec:
@@ -133,12 +153,22 @@ def load_config(path: Path | str = DEFAULT_PATH) -> WardConfig:
     roles: dict[str, RoleSpec] = {}
     owner_of: dict[str, str] = {}
     for name, spec in raw["roles"].items():
+        allowed_raw = spec.get("tools_allowed")
+        if allowed_raw == "*":
+            tools_allowed: tuple[str, ...] | None = ("*",)
+        elif allowed_raw is None:
+            tools_allowed = None
+        else:
+            tools_allowed = tuple(allowed_raw)
         role = RoleSpec(
             name=name,
             display_name=spec["display_name"],
             description=spec.get("description", ""),
             master=bool(spec.get("master", False)),
+            external=bool(spec.get("external", False)),
+            may_delegate=bool(spec.get("may_delegate", False)),
             tools=tuple(spec.get("tools", ())),
+            tools_allowed=tools_allowed,
             callable_by=tuple(spec.get("callable_by", ())),
         )
         roles[name] = role
@@ -151,7 +181,22 @@ def load_config(path: Path | str = DEFAULT_PATH) -> WardConfig:
         raise ConfigError("exactly one role must be master: true")
     if masters[0].tools:
         raise ConfigError("the master role owns no tools; it only delegates")
+    if masters[0].external:
+        raise ConfigError("the master role cannot be external")
     for role in roles.values():
+        if role.external:
+            if role.tools:
+                raise ConfigError(f"external role {role.name} owns no tools; use tools_allowed")
+            if not role.may_delegate:
+                raise ConfigError(f"external role {role.name} must set may_delegate: true")
+            if role.tools_allowed is None:
+                raise ConfigError(f"external role {role.name} needs tools_allowed")
+            if role.tools_allowed != ("*",):
+                for tool in role.tools_allowed:
+                    if tool not in owner_of:
+                        raise ConfigError(f"{role.name}.tools_allowed names unknown tool {tool}")
+        elif role.may_delegate and not role.master:
+            raise ConfigError(f"{role.name}: may_delegate is only for master/external roles")
         for caller in role.callable_by:
             if caller not in roles:
                 raise ConfigError(f"{role.name}.callable_by names unknown role {caller}")

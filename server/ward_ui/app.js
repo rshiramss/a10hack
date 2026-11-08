@@ -12,7 +12,7 @@ const KEY_KINDS = new Set([
 const ICON = { ALLOW: "✓", DENY: "✗", EVENT: "•" };
 
 const state = { lastSeq: 0, epoch: null, audit: [], filter: "key", open: new Set(), snap: null,
-                examplesShown: false, settingsShown: false, fresh: new Set() };
+                examplesShown: false, settingsShown: false, mcpRolesShown: false, fresh: new Set() };
 
 const $ = (id) => document.getElementById(id);
 function el(tag, attrs = {}, children = []) {
@@ -126,11 +126,21 @@ function agentCard(agent, busy) {
 function renderNetwork(snap) {
   const busy = busyInstances(snap);
   const masters = snap.agents.filter((a) => a.master);
+  const externals = snap.agents.filter((a) => a.external);
   const shownMasters = masters.filter((a) => a.status === "active").concat(
     masters.filter((a) => a.status !== "active").slice(0, 2));
-  $("master-row").replaceChildren(...shownMasters.map((a) => agentCard(a, busy)));
+  const shownExt = externals.filter((a) => a.status === "active").concat(
+    externals.filter((a) => a.status !== "active").slice(0, 3));
+  $("master-row").replaceChildren(
+    ...shownMasters.map((a) => agentCard(a, busy)),
+    ...shownExt.map((a) => {
+      const card = agentCard(a, busy);
+      card.classList.add("external");
+      return card;
+    }),
+  );
 
-  const lanes = snap.roles.filter((r) => !r.master).map((role) => {
+  const lanes = snap.roles.filter((r) => !r.master && !r.external).map((role) => {
     const instances = snap.agents.filter((a) => a.role === role.role);
     const live = instances.filter((a) => a.status === "active");
     const ended = instances.filter((a) => a.status !== "active");
@@ -292,6 +302,7 @@ function renderChat(snap) {
 
   const items = [];
   for (const run of [...snap.runs].reverse()) {
+    if (String(run.prompt || "").startsWith("[mcp]")) continue;
     items.push(el("li", { class: "msg user" }, [el("div", { class: "who", text: `you → ${run.master}` }),
       el("div", { class: "body", text: run.prompt })]));
     let body;
@@ -339,6 +350,11 @@ async function send(event) {
 // ---- controls -----------------------------------------------------------------------------
 
 function renderControls(snap) {
+  if (!state.mcpRolesShown && snap.external_roles) {
+    state.mcpRolesShown = true;
+    $("mcp-role").replaceChildren(...snap.external_roles.map((r) =>
+      el("option", { value: r.role, text: `${r.name} (${r.role})` })));
+  }
   if (state.settingsShown) return;
   state.settingsShown = true;
   $("watchdog-seconds").value = snap.settings.watchdog_seconds;
@@ -384,9 +400,24 @@ document.addEventListener("DOMContentLoaded", () => {
   attack("rogue", "/api/rogue");
   attack("steal", "/api/attack/steal");
   attack("tampered", "/api/attack/tampered");
+  $("issue-mcp").addEventListener("click", () => {
+    $("mcp-issue").hidden = !$("mcp-issue").hidden;
+    $("mcp-issue-out").hidden = true;
+  });
+  $("mcp-issue-go").addEventListener("click", async () => {
+    const role = $("mcp-role").value;
+    const r = await post("/api/mcp/issue", { role });
+    if (!r.ok) { say(r.reason, false); return; }
+    const out = $("mcp-issue-out");
+    out.hidden = false;
+    out.textContent =
+      `client_id=${r.client_id}\nsecret=${r.secret}\nrole=${r.role}\n\n${r.warning}\n` +
+      `Set WARD_URL, WARD_CLIENT_ID, WARD_CLIENT_SECRET for scripts/badge_agent.py`;
+    say(`Issued ${r.client_id} — copy the secret now`, true);
+  });
   $("reset").addEventListener("click", async () => {
     const r = await post("/api/reset");
-    state.examplesShown = false; state.settingsShown = false;
+    state.examplesShown = false; state.settingsShown = false; state.mcpRolesShown = false;
     say(r.ok ? "Fresh gateway, fresh agents, fresh audit log." : r.reason, r.ok);
   });
   document.querySelectorAll(".seg-btn").forEach((b) => b.addEventListener("click", () => {

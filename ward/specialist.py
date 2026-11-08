@@ -6,7 +6,7 @@ It has no way to address another agent and never sees natural language from one.
 
 The instance refuses an offer unless:
   - the delegation token verifies against the gateway's Ed25519 public key,
-  - the token's audience is this exact instance and its subject is a master agent,
+  - the token's audience is this exact instance and its subject role is in callable_by,
   - the sealed request opens with this instance's key (bound to its current badge),
   - the request's tool is one this role owns and its args hash matches the token.
 """
@@ -56,7 +56,7 @@ class SpecialistInstance:
         self._secret = client_secret
         self._config = config
         self._gateway_public_pem = gateway_public_pem
-        self._master_role = master_role
+        self._master_role = master_role  # retained for demos; callable_by is authoritative
         self.session: Session | None = None
         # The instance's own key pair; the private half never leaves this object.
         self.key = crypto.AgentKey()
@@ -113,8 +113,12 @@ class SpecialistInstance:
             )
         except jwt.PyJWTError as exc:
             raise OfferRefused("DENY_BAD_DELEGATION", type(exc).__name__) from exc
-        if claims.get("sub_role") != self._master_role:
-            raise OfferRefused("DENY_NOT_MASTER", "only the master agent may delegate")
+        caller_role = claims.get("sub_role")
+        if caller_role not in self._config.roles[self.role].callable_by:
+            raise OfferRefused(
+                "DENY_NOT_CALLABLE",
+                f"{caller_role} is not allowed to delegate to {self.role}",
+            )
         try:
             request = crypto.open_sealed(self.session.seal_key, offer["sealed"], claims["lease"])
         except Exception as exc:  # noqa: BLE001 - any failure to open is a refusal

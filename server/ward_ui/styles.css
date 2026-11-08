@@ -135,6 +135,9 @@ button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
   font-size: var(--text-sm); transition: box-shadow 200ms var(--ease), transform 200ms var(--ease);
 }
 .agent.master { min-width: 280px; border-width: 2px; }
+.agent.external { min-width: 280px; border-style: dashed; }
+.mcp-issue { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--rule); }
+.mcp-issue-out { margin: 0; padding: 0.6rem; background: var(--paper-2, #f3efe6); font-size: var(--text-xs); white-space: pre-wrap; overflow-wrap: anywhere; }
 .agent .name { font-weight: 800; }
 .agent .meta { color: var(--muted); font-size: var(--text-xs); }
 .agent { overflow: hidden; }
