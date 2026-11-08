@@ -778,3 +778,16 @@ def test_ollama_native_client_sets_the_context_window() -> None:
     assert seen["messages"][0]["tool_calls"][0]["function"]["arguments"] == {"a": 1}
     call = reply.choices[0].message.tool_calls[0]
     assert call.function.name == "declare_plan" and json.loads(call.function.arguments)["steps"]
+
+
+@pytest.mark.parametrize("follow_up", ["empty", "repeat"])
+def test_empty_or_repeated_follow_up_means_done(gw: Gateway, follow_up: str) -> None:
+    first = [{"agent": "LabsAgent", "tool": "get_renal_function", "args": {"patient_id": "P004"}}]
+    second = plan_turn([] if follow_up == "empty" else first)
+    llm = FakeLLM([plan_turn(first), second, text_turn("Severe.")])
+    run_id = MasterAgent(gw, llm, "fake", sleep=lambda s: None).handle("P004 kidneys?")
+    run = gw.conn.execute(
+        "SELECT status, plans, answer FROM runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    assert (run["status"], run["plans"], run["answer"]) == ("done", 1, "Severe.")
+    assert not [p for p in gw.snapshot()["runs"][0]["plans"] if p["status"] == "denied"]

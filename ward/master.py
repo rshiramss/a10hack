@@ -93,7 +93,8 @@ FOLLOW_UP = """Typed results so far:
 {results}
 
 If answering the original request needs more consults that use these results, call
-declare_plan again ({left} plan(s) left). Otherwise call answer_directly with "DONE"."""
+declare_plan again with only the NEW steps ({left} plan(s) left). If you have what you
+need, call answer_directly with "DONE". Never send an empty plan or repeat steps."""
 
 ANSWER_PROMPT = """You are OrchestratorAgent. Answer the clinician's request using ONLY the typed
 results below from specialist agents. Be brief and concrete (3-6 sentences). Say which
@@ -425,6 +426,18 @@ class MasterAgent:
             tools = [PLAN_TOOL] if must_replan else [PLAN_TOOL, NO_CONSULT_TOOL]
             message = self._chat(messages, tools)
             kind, payload = _extract_steps(message)
+            if kind == "plan":
+                payload = _normalize_steps(payload, caps)
+                if isinstance(payload, list) and results:
+                    # Steps that already ran this request add nothing: drop them.
+                    payload = [
+                        st
+                        for st in payload
+                        if not (isinstance(st, dict) and (st.get("tool"), st.get("args")) in done)
+                    ]
+                if not payload:
+                    # An empty plan is how small models say "nothing more to do".
+                    kind, payload = ("done" if results else "none"), (message.content or "")
             if kind == "none" and nudges < 1 and not results:
                 # One nudge before giving up: small models sometimes reply in prose.
                 nudges += 1
@@ -440,15 +453,15 @@ class MasterAgent:
             must_replan = False
             added = 0
             if kind == "plan":
-                payload, added = _complete_plan(_normalize_steps(payload, caps), caps, done)
-            label = "planned" if kind == "plan" else "replied"
+                payload, added = _complete_plan(payload, caps, done)
+            label = {"plan": "planned", "done": "has enough results"}.get(kind, "replied")
             if added:
                 label += f" (+{added} prerequisite step{'s' * (added > 1)} filled in from policy)"
             self.gw.report_progress(
                 self._cred("report_progress"),
                 run_id,
                 label,
-                raw=None if kind == "plan" else _raw_reply(message),
+                raw=None if kind in ("plan", "done") else _raw_reply(message),
             )
             if kind != "plan":
                 if results:
