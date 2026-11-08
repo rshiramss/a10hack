@@ -80,8 +80,50 @@ class OllamaNative:
         return SimpleNamespace(choices=[SimpleNamespace(message=reply)])
 
 
+# Groq models good at tool calling, best first. The first one this key can use wins.
+GROQ_PREFERENCE = (
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+    "llama-3.1-8b-instant",
+)
+
+
+class ReasoningAware:
+    """Wraps an OpenAI-compatible client. For reasoning models (gpt-oss), asks for low
+    reasoning effort and leaves room for the answer after the reasoning tokens."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self.chat = SimpleNamespace(completions=self)
+
+    def create(self, **kwargs: Any) -> Any:
+        if "gpt-oss" in str(kwargs.get("model", "")):
+            kwargs.setdefault("reasoning_effort", "low")
+            kwargs["max_tokens"] = max(int(kwargs.get("max_tokens") or 0), 4096)
+        return self._client.chat.completions.create(**kwargs)
+
+
+def pick_groq_model(client: Any, preferred: str | None) -> str:
+    """The configured model if set; else the best model this key can actually use."""
+    if preferred:
+        return preferred
+    try:
+        available = {m.id for m in client.models.list().data}
+    except Exception:  # noqa: BLE001 - fall back to the first preference
+        return GROQ_PREFERENCE[0]
+    for name in GROQ_PREFERENCE:
+        if name in available:
+            return name
+    chat_models = sorted(m for m in available if "whisper" not in m and "guard" not in m)
+    return chat_models[0] if chat_models else GROQ_PREFERENCE[0]
+
+
 def make_llm(num_ctx: int = 8192) -> tuple[Any, str]:
     """(client, model) for the configured backend."""
+    import os
+
     from agents.runner import llm_settings
 
     provider, base_url, api_key, model = llm_settings()
@@ -89,4 +131,7 @@ def make_llm(num_ctx: int = 8192) -> tuple[Any, str]:
         return OllamaNative(base_url, num_ctx=num_ctx), model
     from openai import OpenAI
 
-    return OpenAI(base_url=base_url, api_key=api_key, timeout=120), model
+    client = OpenAI(base_url=base_url, api_key=api_key, timeout=120)
+    if provider == "groq":
+        model = pick_groq_model(client, os.environ.get("BADGE_MODEL") or None)
+    return ReasoningAware(client), model

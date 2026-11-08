@@ -791,3 +791,27 @@ def test_empty_or_repeated_follow_up_means_done(gw: Gateway, follow_up: str) -> 
     ).fetchone()
     assert (run["status"], run["plans"], run["answer"]) == ("done", 1, "Severe.")
     assert not [p for p in gw.snapshot()["runs"][0]["plans"] if p["status"] == "denied"]
+
+
+def test_groq_model_is_picked_from_what_the_key_can_use() -> None:
+    from ward.llm import ReasoningAware, pick_groq_model
+
+    models = SimpleNamespace(
+        list=lambda: SimpleNamespace(
+            data=[
+                SimpleNamespace(id="whisper-large-v3"),
+                SimpleNamespace(id="openai/gpt-oss-20b"),
+                SimpleNamespace(id="llama-3.1-8b-instant"),
+            ]
+        )
+    )
+    client = SimpleNamespace(models=models)
+    assert pick_groq_model(client, None) == "openai/gpt-oss-20b"
+    assert pick_groq_model(client, "my-model") == "my-model"
+
+    seen = {}
+    inner = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: seen.update(kw)))
+    )
+    ReasoningAware(inner).chat.completions.create(model="openai/gpt-oss-20b", max_tokens=900)
+    assert seen["reasoning_effort"] == "low" and seen["max_tokens"] == 4096
