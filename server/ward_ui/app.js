@@ -8,6 +8,8 @@ const KEY_KINDS = new Set([
   "DENIED", "REVOKED", "HANDSHAKE_REFUSED", "OUTPUT_REJECTED", "RESULT_DISCARDED",
   "FORGERY_REFUSED", "INJECTION_FLAGGED", "DELIVERED", "OPERATOR_LOGIN", "OPERATOR_LOGIN_FAILED",
   "POP_REJECTED", "ATTESTATION_FAILED", "BADGE_ROTATED", "STALE_BADGE",
+  "APPROVAL_REQUIRED", "APPROVAL_APPROVED", "APPROVAL_DENIED", "APPROVAL_TIMEOUT",
+  "ESCALATION", "ESCALATION_ACKED", "ESCALATION_PAGE_FAILED", "MCP_CREDENTIAL_ISSUED",
 ]);
 const ICON = { ALLOW: "✓", DENY: "✗", EVENT: "•" };
 
@@ -66,16 +68,66 @@ function render(snap) {
   $("system-id").textContent = snap.system_id;
   $("total-allow").textContent = snap.totals.ALLOW || 0;
   $("total-deny").textContent = snap.totals.DENY || 0;
+  const pending = snap.approval_count || 0;
+  $("total-approvals").textContent = pending;
+  $("approval-badge").hidden = pending === 0;
   const seal = $("chain-seal");
   seal.textContent = snap.chain.ok ? `chain verified · ${snap.chain.rows}` : "chain BROKEN";
   seal.className = `seal ${snap.chain.ok ? "ok" : "broken"}`;
   $("operator-name").textContent = `operator: ${snap.operator}`;
   renderNetwork(snap);
+  renderApprovals(snap);
+  renderEscalations(snap);
   renderRun(snap);
   renderLog();
   renderChat(snap);
   renderControls(snap);
   state.fresh.clear();
+}
+
+function renderApprovals(snap) {
+  const pending = (snap.approvals || []).filter((a) => a.status === "pending");
+  $("approvals-empty").hidden = pending.length > 0;
+  $("approvals").replaceChildren(...pending.map((a) => {
+    const evidence = Object.entries(a.evidence || {}).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(" · ");
+    const args = Object.entries(a.args || {}).map(([k, v]) => `${k}=${v}`).join(", ");
+    const approve = el("button", { type: "button", class: "primary", text: "Approve" });
+    const deny = el("button", { type: "button", class: "danger-outline", text: "Deny" });
+    approve.addEventListener("click", async () => {
+      const r = await post(`/api/approvals/${a.approval_id}/approve`);
+      say(r.ok ? `Approved ${a.approval_id}` : r.reason, r.ok);
+    });
+    deny.addEventListener("click", async () => {
+      const reason = window.prompt("Denial reason", "not clinically appropriate") || "denied";
+      const r = await post(`/api/approvals/${a.approval_id}/deny`, { reason });
+      say(r.ok ? `Denied ${a.approval_id}` : r.reason, r.ok);
+    });
+    return el("li", { class: "approval-card" }, [
+      el("div", { class: "approval-title", text: `${a.tool} · ${a.approval_id}` }),
+      el("div", { class: "meta", text: `args: ${args}` }),
+      evidence ? el("div", { class: "meta", text: `evidence: ${evidence}` }) : null,
+      el("div", { class: "approval-actions" }, [approve, deny]),
+    ]);
+  }));
+}
+
+function renderEscalations(snap) {
+  const open = (snap.escalations || []).filter((e) => e.status === "open");
+  const banner = $("escalation-banner");
+  if (!open.length) { banner.hidden = true; banner.replaceChildren(); return; }
+  banner.hidden = false;
+  banner.replaceChildren(...open.map((e) => {
+    const ack = el("button", { type: "button", text: "Acknowledge" });
+    ack.addEventListener("click", async () => {
+      const r = await post(`/api/escalations/${e.escalation_id}/ack`);
+      say(r.ok ? `Acknowledged ${e.escalation_id}` : r.reason, r.ok);
+    });
+    return el("div", { class: "escalation-item" }, [
+      el("span", { text: `Escalation ${e.escalation_id}: ${e.trigger_reason} — ${e.summary}` }),
+      e.page_id ? el("span", { class: "meta", text: `paged ${e.page_id}` }) : null,
+      ack,
+    ]);
+  }));
 }
 
 // ---- agent network -----------------------------------------------------------------
@@ -230,7 +282,8 @@ function renderRun(snap) {
           resultChips(step),
         ]),
         el("span", { class: `pill ${step.status}`, text: { used: "done", active: "leased", failed: "failed",
-          revoked: "revoked", expired: "expired", unused: "not run" }[step.status] || step.status }),
+          revoked: "revoked", expired: "expired", unused: "not run",
+          awaiting_approval: "awaiting approval" }[step.status] || step.status }),
       ]));
     });
   }

@@ -56,6 +56,7 @@ def cred(token: str, key: crypto.AgentKey, op: str) -> Credential:
 def gw() -> Gateway:
     g = Gateway(CFG, sleep=lambda _s: None)
     g.settings["step_delay_ms"] = 0
+    g.settings["approvals_enabled"] = False  # Feature 2 tests opt in explicitly
     return g
 
 
@@ -228,6 +229,7 @@ def ward_server():
         operators={"alice": "pw"}, llm=object(), model="fake", watchdog=False, sleep=lambda _s: None
     )
     app.state.console.gateway.settings["step_delay_ms"] = 0
+    app.state.console.gateway.settings["approvals_enabled"] = False
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)

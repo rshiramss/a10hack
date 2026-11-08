@@ -51,7 +51,8 @@ CREATE TABLE runs (
     run_id TEXT PRIMARY KEY, master_id TEXT NOT NULL, prompt TEXT NOT NULL,
     status TEXT NOT NULL, created_ms INTEGER NOT NULL, ended_ms INTEGER,
     answer TEXT, error TEXT, plans INTEGER NOT NULL DEFAULT 0,
-    last_progress_ms INTEGER NOT NULL, flagged INTEGER NOT NULL DEFAULT 0
+    last_progress_ms INTEGER NOT NULL, flagged INTEGER NOT NULL DEFAULT 0,
+    approval_paused INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE plans (
     plan_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -63,6 +64,17 @@ CREATE TABLE leases (
     step_index INTEGER NOT NULL, role TEXT NOT NULL, tool TEXT NOT NULL,
     args_json TEXT NOT NULL, status TEXT NOT NULL, target_agent TEXT,
     result_json TEXT, reason TEXT, expires_ms INTEGER NOT NULL, attempts INTEGER DEFAULT 0
+);
+CREATE TABLE approvals (
+    approval_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, lease_id TEXT NOT NULL,
+    tool TEXT NOT NULL, args_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+    status TEXT NOT NULL, created_ms INTEGER NOT NULL, decided_ms INTEGER,
+    operator TEXT, reason TEXT
+);
+CREATE TABLE escalations (
+    escalation_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, run_id TEXT,
+    trigger_reason TEXT NOT NULL, summary TEXT NOT NULL, page_id TEXT,
+    status TEXT NOT NULL, created_ms INTEGER NOT NULL, acked_ms INTEGER, acked_by TEXT
 );
 CREATE TABLE audit (
     seq INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, run_id TEXT, actor TEXT, target TEXT,
@@ -128,6 +140,7 @@ class Gateway:
             "watchdog_seconds": float(config.run["watchdog_seconds"]),
             "step_delay_ms": int(config.run["step_delay_ms"]),
             "replace_revoked_specialists": bool(config.run["replace_revoked_specialists"]),
+            "approvals_enabled": True,
         }
         self.epoch = uuid.uuid4().hex[:8]
         self._seen_proofs: dict[str, float] = {}
@@ -569,7 +582,66 @@ class Gateway:
             ).fetchall():
                 self._end_run(run["run_id"], "aborted", error=f"caller revoked: {why}")
             self._mcp_runs.pop(agent_id, None)
+            trigger = self._escalation_trigger(actor, why)
+            if trigger:
+                self._create_escalation(agent_id, agent["run_id"], trigger, why)
             return True
+
+    def _escalation_trigger(self, actor: str, why: str) -> str | None:
+        text = f"{actor} {why}".lower()
+        mapping = [
+            ("stolen_badge", ("stolen", "without its key", "pop")),
+            ("role_violation", ("role_forbidden", "not_callable", "not_master", "unauthorized")),
+            ("attestation_failure", ("attestation",)),
+            ("watchdog", ("watchdog", "no progress")),
+            ("repeated_denials", ("denied calls",)),
+        ]
+        allowed = set(self.config.escalation.on)
+        for name, needles in mapping:
+            if name in allowed and any(n in text for n in needles):
+                return name
+        return None
+
+    def _create_escalation(self, agent_id: str, run_id: str | None, trigger: str, why: str) -> str:
+        """Caller holds the lock. Pages CareTeam via the tool function; always audits."""
+        esc_id = "ESC-" + uuid.uuid4().hex[:8].upper()
+        page_id = None
+        try:
+            page = TOOLS["page_clinician"](
+                self.conn,
+                self.config,
+                {
+                    "patient_id": self.config.escalation.page_patient_id,
+                    "clinician": self.config.escalation.page_clinician,
+                    "urgency": self.config.escalation.page_urgency,
+                },
+                {},
+            )
+            page_id = page.get("page_id")
+        except Exception as exc:  # noqa: BLE001 - paging is best-effort; escalation remains
+            self._audit(
+                "ESCALATION_PAGE_FAILED",
+                f"Escalation page failed for {agent_id}: {exc}",
+                decision="DENY",
+                reason="ESCALATION_PAGE_FAILED",
+                run_id=run_id,
+                target=agent_id,
+            )
+        self.conn.execute(
+            "INSERT INTO escalations VALUES (?, ?, ?, ?, ?, ?, 'open', ?, NULL, NULL)",
+            (esc_id, agent_id, run_id, trigger, why[:400], page_id, now_ms()),
+        )
+        self._audit(
+            "ESCALATION",
+            f"Escalation {esc_id}: {trigger} — {why[:120]}"
+            + (f"; paged {page_id}" if page_id else ""),
+            decision="DENY",
+            reason=trigger.upper(),
+            run_id=run_id,
+            target=agent_id,
+            detail={"escalation_id": esc_id, "page_id": page_id, "trigger": trigger},
+        )
+        return esc_id
 
     # ---- runs ------------------------------------------------------------------------------
 
@@ -757,11 +829,16 @@ class Gateway:
         )
 
     def watchdog_tick(self) -> None:
-        """Revoke a master that made no progress for `watchdog_seconds`."""
+        """Revoke a caller that made no progress for `watchdog_seconds`.
+
+        Runs waiting on human approval are paused (approval_paused=1) so the watchdog
+        does not trip while an operator decides.
+        """
         limit = self.settings["watchdog_seconds"] * 1000
         with self.lock:
             for run in self.conn.execute(
-                "SELECT run_id, master_id, last_progress_ms FROM runs WHERE status = 'running'"
+                "SELECT run_id, master_id, last_progress_ms FROM runs"
+                " WHERE status = 'running' AND approval_paused = 0"
             ).fetchall():
                 idle = now_ms() - run["last_progress_ms"]
                 if idle > limit:
@@ -973,6 +1050,187 @@ class Gateway:
                     raise Denied("DENY_PRECONDITION", f"no {item.source_tool} result to use")
         return inputs
 
+    # ---- human approval ------------------------------------------------------------------
+
+    def _approval_required(self, tool: str, args: dict[str, Any], inputs: dict[str, Any]) -> bool:
+        if not self.settings.get("approvals_enabled", True):
+            return False
+        for rule in self.config.approvals.rules:
+            if rule.tool != tool:
+                continue
+            if rule.when == "always":
+                return True
+            if rule.when == "arg" and rule.arg is not None and args.get(rule.arg) == rule.equals:
+                return True
+            if rule.when == "evidence" and rule.field is not None:
+                value = inputs.get(rule.field)
+                if value is None and rule.from_tool:
+                    # evidence may live under the piped input name matching source field
+                    value = inputs.get(rule.field)
+                if rule.gte is not None and isinstance(value, int) and value >= rule.gte:
+                    return True
+        return False
+
+    def _begin_approval_if_needed(
+        self,
+        caller: Badge,
+        run_id: str,
+        lease_id: str,
+        tool: str,
+        args: dict[str, Any],
+        inputs: dict[str, Any],
+    ) -> str | None:
+        """Caller holds the lock. Returns approval_id if consult must wait, else None."""
+        existing = self.conn.execute(
+            "SELECT approval_id, status FROM approvals WHERE lease_id = ? ORDER BY created_ms DESC",
+            (lease_id,),
+        ).fetchone()
+        if existing and existing["status"] == "approved":
+            return None
+        if existing and existing["status"] == "pending":
+            return existing["approval_id"]
+        if existing and existing["status"] in ("denied", "timed_out"):
+            reason = (
+                "DENY_APPROVAL_DENIED"
+                if existing["status"] == "denied"
+                else "DENY_APPROVAL_TIMEOUT"
+            )
+            self._denied(caller, reason, f"approval {existing['status']}", run_id, tool)
+        if not self._approval_required(tool, args, inputs):
+            return None
+        approval_id = "APR-" + uuid.uuid4().hex[:8].upper()
+        self.conn.execute(
+            "INSERT INTO approvals VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL)",
+            (
+                approval_id,
+                run_id,
+                lease_id,
+                tool,
+                json.dumps(args, sort_keys=True),
+                json.dumps(inputs, sort_keys=True),
+                now_ms(),
+            ),
+        )
+        self.conn.execute(
+            "UPDATE leases SET status = 'awaiting_approval' WHERE lease_id = ?", (lease_id,)
+        )
+        self.conn.execute("UPDATE runs SET approval_paused = 1 WHERE run_id = ?", (run_id,))
+        self._audit(
+            "APPROVAL_REQUIRED",
+            f"{tool} needs operator approval before the specialist runs",
+            decision="EVENT",
+            run_id=run_id,
+            actor=caller.agent_id,
+            detail={
+                "approval_id": approval_id,
+                "lease": lease_id,
+                "tool": tool,
+                "args": args,
+                "evidence": inputs,
+            },
+        )
+        return approval_id
+
+    def _await_approval(self, caller: Badge, run_id: str, lease_id: str, approval_id: str) -> None:
+        """Poll until approved, denied, or timed out. Lock released between sleeps."""
+        timeout_ms = int(self.config.approvals.timeout_seconds) * 1000
+        started = now_ms()
+        while True:
+            with self.lock:
+                row = self.conn.execute(
+                    "SELECT status, reason FROM approvals WHERE approval_id = ?", (approval_id,)
+                ).fetchone()
+                if row is None:
+                    self._denied(caller, "DENY_APPROVAL_DENIED", "approval missing", run_id)
+                if row["status"] == "approved":
+                    self.conn.execute(
+                        "UPDATE leases SET status = 'active' WHERE lease_id = ?", (lease_id,)
+                    )
+                    self.conn.execute(
+                        "UPDATE runs SET approval_paused = 0, last_progress_ms = ? WHERE run_id = ?",
+                        (now_ms(), run_id),
+                    )
+                    return
+                if row["status"] == "denied":
+                    self._fail_lease(lease_id, "DENY_APPROVAL_DENIED")
+                    self.conn.execute(
+                        "UPDATE runs SET approval_paused = 0 WHERE run_id = ?", (run_id,)
+                    )
+                    self._denied(
+                        caller,
+                        "DENY_APPROVAL_DENIED",
+                        row["reason"] or "operator denied",
+                        run_id,
+                    )
+                if now_ms() - started >= timeout_ms or row["status"] == "timed_out":
+                    self.conn.execute(
+                        "UPDATE approvals SET status = 'timed_out', decided_ms = ?, reason = ?"
+                        " WHERE approval_id = ? AND status = 'pending'",
+                        (now_ms(), "timeout", approval_id),
+                    )
+                    self._fail_lease(lease_id, "DENY_APPROVAL_TIMEOUT")
+                    self.conn.execute(
+                        "UPDATE runs SET approval_paused = 0 WHERE run_id = ?", (run_id,)
+                    )
+                    self._audit(
+                        "APPROVAL_TIMEOUT",
+                        f"Approval {approval_id} timed out",
+                        decision="DENY",
+                        reason="DENY_APPROVAL_TIMEOUT",
+                        run_id=run_id,
+                        detail={"approval_id": approval_id, "lease": lease_id},
+                    )
+                    self._denied(
+                        caller, "DENY_APPROVAL_TIMEOUT", "operator did not decide in time", run_id
+                    )
+            self._sleep(0.05)
+
+    def decide_approval(
+        self, approval_id: str, approve: bool, operator: str, reason: str = ""
+    ) -> bool:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM approvals WHERE approval_id = ?", (approval_id,)
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                return False
+            status = "approved" if approve else "denied"
+            self.conn.execute(
+                "UPDATE approvals SET status = ?, decided_ms = ?, operator = ?, reason = ?"
+                " WHERE approval_id = ?",
+                (status, now_ms(), operator, reason[:200], approval_id),
+            )
+            self._audit(
+                "APPROVAL_APPROVED" if approve else "APPROVAL_DENIED",
+                f"Operator {operator} {status} {approval_id}" + (f": {reason}" if reason else ""),
+                decision="ALLOW" if approve else "DENY",
+                reason="OK" if approve else "DENY_APPROVAL_DENIED",
+                run_id=row["run_id"],
+                actor=f"operator:{operator}",
+                detail={"approval_id": approval_id, "lease": row["lease_id"], "reason": reason},
+            )
+            return True
+
+    def acknowledge_escalation(self, escalation_id: str, operator: str) -> bool:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT status FROM escalations WHERE escalation_id = ?", (escalation_id,)
+            ).fetchone()
+            if row is None or row["status"] != "open":
+                return False
+            self.conn.execute(
+                "UPDATE escalations SET status = 'acknowledged', acked_ms = ?, acked_by = ?"
+                " WHERE escalation_id = ?",
+                (now_ms(), operator, escalation_id),
+            )
+            self._audit(
+                "ESCALATION_ACKED",
+                f"Operator {operator} acknowledged {escalation_id}",
+                actor=f"operator:{operator}",
+                detail={"escalation_id": escalation_id},
+            )
+            return True
+
     # ---- consult: the two-way handshake ---------------------------------------------------
 
     def consult(self, cred: Credential, lease_id: str) -> dict[str, Any]:
@@ -981,7 +1239,7 @@ class Gateway:
     def _consult_as(self, caller: Badge, lease_id: str) -> dict[str, Any]:
         delay = self.settings["step_delay_ms"] / 1000
 
-        # Phase A: lease checks, typed inputs, specialist instance, delegation.
+        # Phase A: lease checks, typed inputs, optional human approval, then delegation.
         with self.lock:
             lease = self.conn.execute(
                 "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
@@ -990,7 +1248,7 @@ class Gateway:
             if lease is None:
                 self._denied(caller, "DENY_NO_LEASE", "unknown lease", None)
             self._run(run_id, caller)
-            if lease["status"] != "active":
+            if lease["status"] not in ("active", "awaiting_approval"):
                 self._denied(
                     caller, "DENY_LEASE_USED", f"lease is {lease['status']}", run_id, lease["tool"]
                 )
@@ -1000,7 +1258,8 @@ class Gateway:
                 )
                 self._denied(caller, "DENY_LEASE_EXPIRED", "plan TTL passed", run_id, lease["tool"])
             earlier = self.conn.execute(
-                "SELECT COUNT(*) FROM leases WHERE plan_id = ? AND step_index < ? AND status = 'active'",
+                "SELECT COUNT(*) FROM leases WHERE plan_id = ? AND step_index < ?"
+                " AND status IN ('active', 'awaiting_approval')",
                 (lease["plan_id"], lease["step_index"]),
             ).fetchone()[0]
             if earlier:
@@ -1017,6 +1276,24 @@ class Gateway:
             except Denied as exc:
                 self._fail_lease(lease_id, exc.reason)
                 self._denied(caller, exc.reason, exc.detail, run_id, lease["tool"])
+            approval_id = self._begin_approval_if_needed(
+                caller, run_id, lease_id, lease["tool"], args, inputs
+            )
+
+        if approval_id:
+            self._await_approval(caller, run_id, lease_id, approval_id)
+
+        with self.lock:
+            lease = self.conn.execute(
+                "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+            self._run(run_id, caller)
+            if lease["status"] != "active":
+                self._denied(
+                    caller, "DENY_LEASE_USED", f"lease is {lease['status']}", run_id, lease["tool"]
+                )
+            args = json.loads(lease["args_json"])
+            inputs = self._gather_inputs(run_id, lease["tool"], args)
             instance = self._instance_for(run_id, lease["role"])
             offer, challenge = self._offer(caller, lease, instance, args, inputs)
 
@@ -1504,6 +1781,38 @@ class Gateway:
                     "SELECT decision, COUNT(*) FROM audit GROUP BY decision"
                 )
             }
+            approvals = [
+                {
+                    "approval_id": a["approval_id"],
+                    "run_id": a["run_id"],
+                    "lease_id": a["lease_id"],
+                    "tool": a["tool"],
+                    "args": json.loads(a["args_json"]),
+                    "evidence": json.loads(a["evidence_json"]),
+                    "status": a["status"],
+                    "created_ms": a["created_ms"],
+                    "operator": a["operator"],
+                    "reason": a["reason"],
+                }
+                for a in self.conn.execute(
+                    "SELECT * FROM approvals ORDER BY created_ms DESC LIMIT 40"
+                )
+            ]
+            escalations = [
+                {
+                    "escalation_id": e["escalation_id"],
+                    "agent_id": e["agent_id"],
+                    "run_id": e["run_id"],
+                    "trigger_reason": e["trigger_reason"],
+                    "summary": e["summary"],
+                    "page_id": e["page_id"],
+                    "status": e["status"],
+                    "created_ms": e["created_ms"],
+                }
+                for e in self.conn.execute(
+                    "SELECT * FROM escalations ORDER BY created_ms DESC LIMIT 40"
+                )
+            ]
         chain_ok, chain_rows = self.verify_chain()
         return {
             "agents": agents,
@@ -1514,6 +1823,9 @@ class Gateway:
             "chain": {"ok": chain_ok, "rows": chain_rows},
             "system_id": self.config.system_id,
             "epoch": self.epoch,
+            "approvals": approvals,
+            "approval_count": sum(1 for a in approvals if a["status"] == "pending"),
+            "escalations": escalations,
             "roles": [
                 {
                     "role": r.name,

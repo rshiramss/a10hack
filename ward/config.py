@@ -83,6 +83,31 @@ class RoleSpec:
 
 
 @dataclass(frozen=True)
+class ApprovalRule:
+    tool: str
+    when: str  # "always" | "arg" | "evidence"
+    arg: str | None = None
+    equals: Any = None
+    from_tool: str | None = None
+    field: str | None = None
+    gte: int | None = None
+
+
+@dataclass(frozen=True)
+class ApprovalsConfig:
+    timeout_seconds: int
+    rules: tuple[ApprovalRule, ...] = ()
+
+
+@dataclass(frozen=True)
+class EscalationConfig:
+    on: tuple[str, ...] = ()
+    page_patient_id: str = "P001"
+    page_clinician: str = "DR-201"
+    page_urgency: str = "stat"
+
+
+@dataclass(frozen=True)
 class WardConfig:
     system_id: str
     badge_ttl_seconds: int
@@ -96,6 +121,8 @@ class WardConfig:
     allergy_blocks: dict[str, tuple[str, ...]]
     injection_patterns: tuple[re.Pattern[str], ...] = field(default=())
     master: dict[str, Any] = field(default_factory=dict)
+    approvals: ApprovalsConfig = field(default_factory=lambda: ApprovalsConfig(timeout_seconds=120))
+    escalation: EscalationConfig = field(default_factory=EscalationConfig)
 
     @property
     def master_role(self) -> str:
@@ -234,6 +261,50 @@ def load_config(path: Path | str = DEFAULT_PATH) -> WardConfig:
                 )
 
     run = dict(raw["run"])
+    approval_rules: list[ApprovalRule] = []
+    for rule in raw.get("approvals", {}).get("rules", []):
+        when_raw = rule.get("when", "always")
+        if when_raw == "always":
+            approval_rules.append(ApprovalRule(tool=rule["tool"], when="always"))
+        elif isinstance(when_raw, dict) and "arg" in when_raw:
+            approval_rules.append(
+                ApprovalRule(
+                    tool=rule["tool"],
+                    when="arg",
+                    arg=str(when_raw["arg"]),
+                    equals=when_raw.get("equals"),
+                )
+            )
+        elif isinstance(when_raw, dict) and "evidence" in when_raw:
+            approval_rules.append(
+                ApprovalRule(
+                    tool=rule["tool"],
+                    when="evidence",
+                    from_tool=str(when_raw.get("from_tool", "")),
+                    field=str(when_raw.get("field") or when_raw.get("evidence")),
+                    gte=int(when_raw["gte"]) if "gte" in when_raw else None,
+                )
+            )
+        else:
+            raise ConfigError(f"approvals rule for {rule.get('tool')}: bad when {when_raw!r}")
+        if rule["tool"] not in tools:
+            raise ConfigError(f"approvals rule names unknown tool {rule['tool']}")
+    approvals = ApprovalsConfig(
+        timeout_seconds=int(raw.get("approvals", {}).get("timeout_seconds", 120)),
+        rules=tuple(approval_rules),
+    )
+    esc_raw = raw.get("escalation", {})
+    page = esc_raw.get("page", {})
+    # Prefer `triggers` — YAML's `on:` is parsed as boolean True.
+    triggers = esc_raw.get("triggers") or esc_raw.get("on") or ()
+    if isinstance(triggers, bool):
+        triggers = ()
+    escalation = EscalationConfig(
+        on=tuple(triggers),
+        page_patient_id=str(page.get("patient_id", "P001")),
+        page_clinician=str(page.get("clinician", "DR-201")),
+        page_urgency=str(page.get("urgency", "stat")),
+    )
     return WardConfig(
         system_id=raw["system_id"],
         badge_ttl_seconds=int(raw["identity"]["badge_ttl_seconds"]),
@@ -249,4 +320,6 @@ def load_config(path: Path | str = DEFAULT_PATH) -> WardConfig:
         injection_patterns=tuple(
             re.compile(p, re.MULTILINE) for p in raw["scanners"]["injection_patterns"]
         ),
+        approvals=approvals,
+        escalation=escalation,
     )

@@ -368,6 +368,30 @@ master:
     - request: "How much does naproxen cost without insurance?"
       answer: "None of the specialists report cash prices. InsuranceAgent can give coverage and the monthly copay for a specific patient instead."
 
+# Human approval: consult pauses until an operator approves, denies, or the timeout fires.
+approvals:
+  timeout_seconds: 120
+  rules:
+    - tool: draft_order
+      when: always
+    - tool: page_clinician
+      when: { arg: urgency, equals: stat }
+    - tool: request_prior_auth
+      when: always
+
+# Security revocations create an escalation and page the on-call clinician.
+escalation:
+  triggers:
+    - stolen_badge
+    - role_violation
+    - attestation_failure
+    - watchdog
+    - repeated_denials
+  page:
+    patient_id: P001
+    clinician: DR-201
+    urgency: stat
+
 # Which allergy blocks which drug class (used by the prescriber's atomic function).
 allergy_blocks:
   penicillin: [penicillin]

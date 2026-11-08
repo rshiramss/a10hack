@@ -320,6 +320,37 @@ def create_app(
         c.reset()
         return JSONResponse({"ok": True})
 
+    @app.post("/api/approvals/{approval_id}/approve")
+    async def approve(request: Request, approval_id: str) -> JSONResponse:
+        if (bad := guarded(request)) is not None:
+            return bad
+        ok = app.state.console.gateway.decide_approval(
+            approval_id, True, operator(request) or "unknown"
+        )
+        return JSONResponse({"ok": ok, "reason": "OK" if ok else "NOT_PENDING"})
+
+    @app.post("/api/approvals/{approval_id}/deny")
+    async def deny_approval(request: Request, approval_id: str) -> JSONResponse:
+        if (bad := guarded(request)) is not None:
+            return bad
+        body = await request.json()
+        ok = app.state.console.gateway.decide_approval(
+            approval_id,
+            False,
+            operator(request) or "unknown",
+            str(body.get("reason", ""))[:200],
+        )
+        return JSONResponse({"ok": ok, "reason": "OK" if ok else "NOT_PENDING"})
+
+    @app.post("/api/escalations/{escalation_id}/ack")
+    async def ack_escalation(request: Request, escalation_id: str) -> JSONResponse:
+        if (bad := guarded(request)) is not None:
+            return bad
+        ok = app.state.console.gateway.acknowledge_escalation(
+            escalation_id, operator(request) or "unknown"
+        )
+        return JSONResponse({"ok": ok, "reason": "OK" if ok else "NOT_OPEN"})
+
     @app.post("/api/mcp/issue")
     async def mcp_issue(request: Request) -> JSONResponse:
         if (bad := guarded(request)) is not None:

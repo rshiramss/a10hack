@@ -20,6 +20,7 @@
       <div class="totals" aria-label="Decision totals">
         <span class="total allow"><b id="total-allow">0</b> allowed</span>
         <span class="total deny"><b id="total-deny">0</b> denied</span>
+        <span class="total approval" id="approval-badge" hidden><b id="total-approvals">0</b> awaiting</span>
       </div>
       <div id="chain-seal" class="seal" role="status">chain …</div>
       <div class="session">
@@ -28,6 +29,7 @@
       </div>
     </div>
   </header>
+  <div id="escalation-banner" class="escalation-banner" hidden role="alert"></div>
 
   <section id="login" class="login" hidden>
     <form id="login-form" class="login-card">
@@ -51,6 +53,15 @@
         <div id="master-row" class="master-row"></div>
         <div class="gateway-bar"><span>GATEWAY</span><small>attested code · encrypted key-bound badge, rotated every 45s · signed call · lease · delegation · sealed consult · handshake · typed output</small></div>
         <div id="lanes" class="lanes"></div>
+      </section>
+
+      <section class="panel approvals" aria-labelledby="approvals-heading">
+        <div class="panel-head">
+          <h2 id="approvals-heading">Approvals</h2>
+          <span class="muted small">Human sign-off before high-impact tools run</span>
+        </div>
+        <ul id="approvals" class="approval-list"></ul>
+        <p id="approvals-empty" class="muted">No pending approvals.</p>
       </section>
 
       <section class="panel run" aria-labelledby="run-heading">

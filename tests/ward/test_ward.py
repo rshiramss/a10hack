@@ -81,7 +81,9 @@ def rx_plan(patient: str, drug: str, dose: int, renal: bool = True) -> list[dict
 
 @pytest.fixture
 def gw() -> Gateway:
-    return Gateway(CFG, sleep=lambda s: None)
+    g = Gateway(CFG, sleep=lambda s: None)
+    g.settings["approvals_enabled"] = False  # Feature 2 tests opt in explicitly
+    return g
 
 
 @pytest.fixture
@@ -493,6 +495,7 @@ def test_console_login_chat_and_revoke() -> None:
     app = create_app(
         llm=llm, model="fake", operators={"alice": "pw"}, watchdog=False, sleep=lambda s: None
     )
+    app.state.console.gateway.settings["approvals_enabled"] = False
     client = TestClient(app)
     h = {"X-Ward": "1"}
     assert client.get("/api/state").status_code == 401
