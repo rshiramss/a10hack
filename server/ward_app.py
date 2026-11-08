@@ -240,7 +240,9 @@ def create_app(
         body = await request.json()
         s = app.state.console.gateway.settings
         if "watchdog_seconds" in body:
-            s["watchdog_seconds"] = float(min(300, max(3, float(body["watchdog_seconds"]))))
+            # Floor: the master's model needs a few seconds per reply; below this the
+            # watchdog would revoke a healthy agent.
+            s["watchdog_seconds"] = float(min(300, max(10, float(body["watchdog_seconds"]))))
         if "step_delay_ms" in body:
             s["step_delay_ms"] = int(min(5000, max(0, int(body["step_delay_ms"]))))
         if "replace_revoked_specialists" in body:

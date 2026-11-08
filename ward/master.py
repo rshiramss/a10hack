@@ -89,7 +89,7 @@ declare_plan again ({left} plan(s) left). Otherwise call answer_directly with "D
 
 ANSWER_PROMPT = """You are OrchestratorAgent. Answer the clinician's request using ONLY the typed
 results below from specialist agents. Be brief and concrete (3-6 sentences). Say which
-facts came from which agent. If asked for a total, add up the numbers and show the sum.
+facts came from which agent. If (and only if) the request asks for a total, add up the numbers.
 If a step was denied, rejected, or skipped, say what couldn't be checked; don't guess.
 If an order was drafted, give its order id; if blocked, give the block reasons.
 Synthetic demo data, not medical advice."""
@@ -124,6 +124,22 @@ def _example_plan(caps: list[dict[str, Any]]) -> str:
         for name in step["args"]:
             step["args"][name] = shared.setdefault(name, step["args"][name])
     return json.dumps({"steps": steps})
+
+
+def _capabilities_text(caps: list[dict[str, Any]]) -> str:
+    """Policy capabilities grouped by agent, so a small model pairs tools with owners."""
+    lines: list[str] = []
+    for agent in dict.fromkeys(c["agent"] for c in caps):
+        lines.append(f"{agent} (only this agent can run these tools):")
+        for c in (c for c in caps if c["agent"] == agent):
+            args = ", ".join(f"{a}: {d}" for a, d in c["args"].items())
+            line = f"  - {c['tool']}({args}) — {c['description']}"
+            if c["needs_earlier_steps"]:
+                line += f" Needs earlier steps: {', '.join(c['needs_earlier_steps'])}."
+            if c["uses_if_present"]:
+                line += f" Uses if present: {', '.join(c['uses_if_present'])}."
+            lines.append(line + f" Returns {json.dumps(c['returns'])}")
+    return "\n".join(lines)
 
 
 def _extract_steps(message: Any) -> tuple[str, Any]:
@@ -212,7 +228,7 @@ class MasterAgent:
         caps = self.gw.capabilities(token)
         max_plans = int(self.gw.config.run["max_plans_per_run"])
         system = PLANNER_PROMPT.format(
-            capabilities=json.dumps(caps, indent=1),
+            capabilities=_capabilities_text(caps),
             example=_example_plan(caps),
             max_plans=max_plans,
         )
@@ -222,8 +238,12 @@ class MasterAgent:
         ]
         results: list[dict[str, Any]] = []
         plans_used = 0
+        must_replan = False
         while plans_used < max_plans:
-            message = self._chat(messages, [PLAN_TOOL, NO_CONSULT_TOOL])
+            # After a rejected plan the model must fix it: answer_directly isn't offered.
+            tools = [PLAN_TOOL] if must_replan else [PLAN_TOOL, NO_CONSULT_TOOL]
+            message = self._chat(messages, tools)
+            must_replan = False
             kind, payload = _extract_steps(message)
             self.gw.report_progress(token, run_id, "planned" if kind == "plan" else "replied")
             if kind != "plan":
@@ -250,10 +270,11 @@ class MasterAgent:
                     {
                         "role": "user",
                         "content": f"The gateway rejected that plan: {exc.reason} — {exc.detail}. "
-                        "Fix it and call declare_plan again, or answer_directly if "
-                        "the request can't be served with these tools.",
+                        "The request can be served; fix exactly that problem and call "
+                        "declare_plan again.",
                     }
                 )
+                must_replan = True
                 continue
             new = self._execute(token, run_id, plan, fault)
             results.extend(new)

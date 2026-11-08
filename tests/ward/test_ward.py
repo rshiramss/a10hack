@@ -485,3 +485,29 @@ def test_master_explains_when_it_cannot_plan(gw: Gateway) -> None:
     run_id = agent.handle("What's the cash price of apixaban?")
     answer = gw.conn.execute("SELECT answer FROM runs WHERE run_id = ?", (run_id,)).fetchone()[0]
     assert answer == "No specialist reports drug prices."
+
+
+def test_after_a_rejected_plan_the_master_must_replan(gw: Gateway) -> None:
+    bad = [
+        {
+            "agent": "PharmacyAgent",
+            "tool": "check_coverage",
+            "args": {"patient_id": "P002", "drug": "warfarin"},
+        }
+    ]
+    good = [
+        {
+            "agent": "InsuranceAgent",
+            "tool": "check_coverage",
+            "args": {"patient_id": "P002", "drug": "warfarin"},
+        }
+    ]
+    llm = FakeLLM([plan_turn(bad), plan_turn(good), done_turn(), text_turn("$10/month.")])
+    agent = MasterAgent(gw, llm, "fake", sleep=lambda s: None)
+    run_id = agent.handle("coverage for warfarin, P002")
+    retry_tools = [t["function"]["name"] for t in llm.requests[1]["tools"]]
+    assert retry_tools == ["declare_plan"]  # giving up isn't an option after a rejection
+    assert (
+        gw.conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()[0]
+        == "done"
+    )

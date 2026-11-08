@@ -98,7 +98,7 @@
       </form>
       <details class="controls">
         <summary><h3>Demo controls</h3></summary>
-        <label>Watchdog <input id="watchdog-seconds" type="number" min="3" max="300" step="1"> s</label>
+        <label title="Must be longer than the model takes to reply (min 10 s).">Watchdog <input id="watchdog-seconds" type="number" min="10" max="300" step="1"> s <span class="muted small">(min 10)</span></label>
         <label>Step pace <input id="step-delay" type="range" min="0" max="3000" step="100"> <span id="step-delay-text"></span></label>
         <label class="toggle"><input id="replace" type="checkbox"> replace a revoked specialist once</label>
         <div class="control-buttons">

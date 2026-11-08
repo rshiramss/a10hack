@@ -49,6 +49,7 @@ async function poll() {
   const snap = await response.json();
   if (snap.epoch !== state.epoch) {           // console was reset: start the log over
     state.epoch = snap.epoch; state.audit = []; state.lastSeq = 0; state.open.clear();
+    state.examplesShown = false; state.settingsShown = false;
     if (snap.audit.length === 0 || snap.audit[0].seq !== 1) { setTimeout(poll, 0); return; }
   }
   for (const entry of snap.audit) { state.audit.push(entry); state.fresh.add(entry.seq); }
@@ -313,6 +314,7 @@ async function saveSettings() {
   };
   $("step-delay-text").textContent = `${body.step_delay_ms} ms`;
   const r = await post("/api/settings", body);
+  if (r.ok) $("watchdog-seconds").value = r.settings.watchdog_seconds;
   say(r.ok ? "Settings saved" : r.reason, r.ok);
 }
 
