@@ -1698,7 +1698,7 @@ class Gateway:
                 (f'%"{lease_id}"%',),
             )
         )
-        by_kind = {e["kind"]: e for e in events}
+        by_kind = {e["kind"]: dict(e) for e in events}
         details = {e["kind"]: json.loads(e["detail_json"] or "{}") for e in events}
         specialist_label = (
             lease["target_agent"] or self.config.roles[lease["role"]].display_name
