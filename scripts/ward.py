@@ -26,7 +26,10 @@ def main() -> None:
     app = create_app()
     llm = app.state.console.model
     print(f"\n  Badge · Ward console  →  http://{args.host}:{args.port}/")
-    print("  Operator logins: alice / alice123, bob / bob123 (override with WARD_OPERATORS)")
+    print(
+        "  Operator logins: alice / ward-demo-Qx7m, bob / ward-demo-Kp3v"
+        " (override with WARD_OPERATORS)"
+    )
     print(f"  Master agent model: {llm}\n")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

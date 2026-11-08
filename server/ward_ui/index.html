@@ -36,7 +36,7 @@
       <label>Username <input name="username" autocomplete="username" required maxlength="32"></label>
       <label>Password <input name="password" type="password" autocomplete="current-password" required maxlength="128"></label>
       <button type="submit" class="primary">Sign in</button>
-      <p class="muted small">Demo logins: <code>alice / alice123</code>, <code>bob / bob123</code> (set <code>WARD_OPERATORS</code> to change).</p>
+      <p class="muted small">Demo logins: <code>alice / ward-demo-Qx7m</code>, <code>bob / ward-demo-Kp3v</code> (set <code>WARD_OPERATORS</code> to change).</p>
       <p id="login-error" class="error" role="alert"></p>
     </form>
   </section>
@@ -90,7 +90,7 @@
         <div id="examples" class="examples"></div>
       </details>
       <form id="chat-form" class="chat-form">
-        <textarea id="prompt" rows="3" maxlength="2000" placeholder="Ask about a patient (P001–P008), a drug, or an order…"></textarea>
+        <textarea id="prompt" rows="3" maxlength="2000" placeholder="Ask about a patient (by name or id, e.g. Jordan or P002), a drug, an order, or coverage…"></textarea>
         <div class="chat-actions">
           <label class="toggle" title="The master stalls after its first consult; the watchdog revokes it."><input id="stuck" type="checkbox"> stuck-agent mode</label>
           <button id="send" type="submit" class="primary">Send</button>

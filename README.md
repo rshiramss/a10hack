@@ -5,7 +5,7 @@
 ```bash
 uv sync
 ollama pull qwen2.5:3b            # the master agent's brain; Ollama must be running
-uv run python -m scripts.ward     # open http://127.0.0.1:8000/  ·  sign in: alice / alice123
+uv run python -m scripts.ward     # open http://127.0.0.1:8000/  ·  sign in: alice / ward-demo-Qx7m
 ```
 
 A chat on the right talks to **OrchestratorAgent**, the master agent (a small local LLM).

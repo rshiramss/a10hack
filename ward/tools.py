@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ward.config import WardConfig
+from ward.data import COPAY_BY_TIER, UNCOVERED_MONTHLY_USD
 
 ToolFn = Callable[[sqlite3.Connection, WardConfig, dict[str, Any], dict[str, Any]], dict[str, Any]]
 
@@ -25,6 +26,15 @@ def _renal_band(egfr: int) -> str:
     if egfr >= 30:
         return "moderate"
     return "severe"
+
+
+def find_patient(conn, config, args, inputs):  # noqa: ANN001, ANN201
+    wanted = " ".join(args["name"].lower().split())
+    for row in conn.execute("SELECT patient_id, name FROM patients ORDER BY patient_id"):
+        full = row["name"].lower()
+        if wanted in (full, full.split()[0], full.split()[-1]):
+            return {"found": True, "patient_id": row["patient_id"]}
+    return {"found": False, "patient_id": ""}
 
 
 def get_active_medications(conn, config, args, inputs):  # noqa: ANN001, ANN201
@@ -88,7 +98,15 @@ def check_coverage(conn, config, args, inputs):  # noqa: ANN001, ANN201
     ).fetchone()
     max_tier = 2 if plan and plan["plan"] == "basic" else 3
     covered = plan is not None and drug["tier"] <= max_tier
-    return {"covered": covered, "tier": drug["tier"], "prior_auth": bool(drug["prior_auth"])}
+    copay = (
+        COPAY_BY_TIER.get(drug["tier"], UNCOVERED_MONTHLY_USD) if covered else UNCOVERED_MONTHLY_USD
+    )
+    return {
+        "covered": covered,
+        "tier": drug["tier"],
+        "prior_auth": bool(drug["prior_auth"]),
+        "monthly_copay_usd": copay,
+    }
 
 
 def draft_order(conn, config, args, inputs):  # noqa: ANN001, ANN201
@@ -113,6 +131,7 @@ def draft_order(conn, config, args, inputs):  # noqa: ANN001, ANN201
 
 
 TOOLS: dict[str, ToolFn] = {
+    "find_patient": find_patient,
     "get_active_medications": get_active_medications,
     "get_allergies": get_allergies,
     "lookup_drug": lookup_drug,

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import jwt
@@ -10,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server.ward_app import create_app
-from tests.ward.fakes import FakeLLM, plan_turn, text_turn
+from tests.ward.fakes import FakeLLM, done_turn, plan_turn, text_turn
 from ward import crypto
 from ward.config import ConfigError, load_config
 from ward.gateway import Denied, Gateway
@@ -336,7 +338,11 @@ def test_audit_chain_detects_tampering(master) -> None:  # noqa: ANN001
 
 def test_master_end_to_end_with_a_fake_model(gw: Gateway) -> None:
     llm = FakeLLM(
-        [plan_turn(rx_plan("P003", "amoxicillin", 1500)), text_turn("Blocked: penicillin allergy.")]
+        [
+            plan_turn(rx_plan("P003", "amoxicillin", 1500)),
+            done_turn(),
+            text_turn("Blocked: penicillin allergy."),
+        ]
     )
     agent = MasterAgent(gw, llm, "fake", sleep=lambda s: None)
     run_id = agent.handle("antibiotic for P003")
@@ -350,7 +356,7 @@ def test_master_end_to_end_with_a_fake_model(gw: Gateway) -> None:
 def test_master_gets_one_retry_after_a_rejected_plan(gw: Gateway) -> None:
     bad = [{"agent": "PharmacyAgent", "tool": "get_allergies", "args": {"patient_id": "P002"}}]
     good = [{"agent": "MedHistoryAgent", "tool": "get_allergies", "args": {"patient_id": "P002"}}]
-    llm = FakeLLM([plan_turn(bad), plan_turn(good), text_turn("Sulfa allergy.")])
+    llm = FakeLLM([plan_turn(bad), plan_turn(good), done_turn(), text_turn("Sulfa allergy.")])
     agent = MasterAgent(gw, llm, "fake", sleep=lambda s: None)
     run_id = agent.handle("allergies for P002")
     assert (
@@ -391,7 +397,9 @@ def test_config_rejects_a_master_that_owns_tools(tmp_path) -> None:  # noqa: ANN
 
 
 def test_console_login_chat_and_revoke() -> None:
-    llm = FakeLLM([plan_turn(rx_plan("P003", "doxycycline", 200)), text_turn("Drafted.")])
+    llm = FakeLLM(
+        [plan_turn(rx_plan("P003", "doxycycline", 200)), done_turn(), text_turn("Drafted.")]
+    )
     app = create_app(
         llm=llm, model="fake", operators={"alice": "pw"}, watchdog=False, sleep=lambda s: None
     )
@@ -423,3 +431,57 @@ def test_console_login_chat_and_revoke() -> None:
 def test_delegation_tokens_use_ed25519(gw: Gateway) -> None:
     token = gw.keys.sign_delegation({"sub": "a", "aud": "b", "exp": 9999999999})
     assert jwt.get_unverified_header(token)["alg"] == "EdDSA"
+
+
+def test_follow_up_plans_use_earlier_results(gw: Gateway) -> None:
+    """Name -> id, then id -> meds, then meds -> coverage: three plans, each built from
+    the typed results of the one before."""
+    find = [{"agent": "RegistrationAgent", "tool": "find_patient", "args": {"name": "Jordan"}}]
+    meds = [
+        {
+            "agent": "MedHistoryAgent",
+            "tool": "get_active_medications",
+            "args": {"patient_id": "P002"},
+        }
+    ]
+    cover = [
+        {
+            "agent": "InsuranceAgent",
+            "tool": "check_coverage",
+            "args": {"patient_id": "P002", "drug": d},
+        }
+        for d in ("warfarin", "lisinopril")
+    ]
+    llm = FakeLLM([plan_turn(find), plan_turn(meds), plan_turn(cover), text_turn("$20/month.")])
+    agent = MasterAgent(gw, llm, "fake", sleep=lambda s: None)
+    run_id = agent.handle("What does Jordan pay per month?")
+    run = gw.conn.execute("SELECT status, plans FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    assert (run["status"], run["plans"]) == ("done", 3)
+    copays = [
+        json.loads(r[0])["monthly_copay_usd"]
+        for r in gw.conn.execute(
+            "SELECT result_json FROM leases WHERE run_id = ? AND tool = 'check_coverage'", (run_id,)
+        )
+    ]
+    assert copays == [10, 10]
+    second_call = llm.requests[1]["messages"][-1]["content"]
+    assert '"patient_id": "P002"' in second_call  # the follow-up saw the typed lookup result
+
+
+def test_master_explains_when_it_cannot_plan(gw: Gateway) -> None:
+    explain = SimpleNamespace(
+        content=None,
+        tool_calls=[
+            SimpleNamespace(
+                id="c",
+                function=SimpleNamespace(
+                    name="answer_directly",
+                    arguments='{"answer": "No specialist reports drug prices."}',
+                ),
+            )
+        ],
+    )
+    agent = MasterAgent(gw, FakeLLM([explain]), "fake", sleep=lambda s: None)
+    run_id = agent.handle("What's the cash price of apixaban?")
+    answer = gw.conn.execute("SELECT answer FROM runs WHERE run_id = ?", (run_id,)).fetchone()[0]
+    assert answer == "No specialist reports drug prices."

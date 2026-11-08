@@ -66,6 +66,10 @@ Rules for plans:
   same patient_id / drug values. Include uses_if_present steps when they are relevant.
 - Never repeat an identical step. Keep plans short: only what the request needs.
 - Patient ids look like P001. Doses are total mg per day.
+- Every argument must be known when you declare the plan. If a step needs a value you
+  don't have yet (a patient's id from their name, the drugs a patient takes), declare a
+  plan for what you can do now. You'll get the typed results and can declare a follow-up
+  plan that uses them (up to {max_plans} plans per request).
 
 Available consults (from policy):
 {capabilities}
@@ -73,14 +77,22 @@ Available consults (from policy):
 Example of the plan format (values are illustrative):
 {example}
 
-Call declare_plan with your steps. If the request needs no patient or drug facts, call
-answer_directly instead."""
+Call declare_plan with your steps. Call answer_directly instead if the request needs no
+patient or drug facts, or if no listed tool can provide what's asked: then say plainly which
+information isn't available through the specialists."""
+
+FOLLOW_UP = """Typed results so far:
+{results}
+
+If answering the original request needs more consults that use these results, call
+declare_plan again ({left} plan(s) left). Otherwise call answer_directly with "DONE"."""
 
 ANSWER_PROMPT = """You are OrchestratorAgent. Answer the clinician's request using ONLY the typed
 results below from specialist agents. Be brief and concrete (3-6 sentences). Say which
-facts came from which agent. If a step was denied, rejected, or skipped, say what couldn't be
-checked and don't guess. If an order was drafted, give its order id; if blocked, give the
-block reasons. Synthetic demo data, not medical advice."""
+facts came from which agent. If asked for a total, add up the numbers and show the sum.
+If a step was denied, rejected, or skipped, say what couldn't be checked; don't guess.
+If an order was drafted, give its order id; if blocked, give the block reasons.
+Synthetic demo data, not medical advice."""
 
 
 def _example_plan(caps: list[dict[str, Any]]) -> str:
@@ -198,39 +210,63 @@ class MasterAgent:
 
     def _handle(self, token: str, run_id: str, prompt: str, fault: str | None) -> None:
         caps = self.gw.capabilities(token)
+        max_plans = int(self.gw.config.run["max_plans_per_run"])
         system = PLANNER_PROMPT.format(
-            capabilities=json.dumps(caps, indent=1), example=_example_plan(caps)
+            capabilities=json.dumps(caps, indent=1),
+            example=_example_plan(caps),
+            max_plans=max_plans,
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ]
         results: list[dict[str, Any]] = []
-        max_plans = int(self.gw.config.run["max_plans_per_run"])
-        for attempt in range(max_plans):
+        plans_used = 0
+        while plans_used < max_plans:
             message = self._chat(messages, [PLAN_TOOL, NO_CONSULT_TOOL])
             kind, payload = _extract_steps(message)
             self.gw.report_progress(token, run_id, "planned" if kind == "plan" else "replied")
             if kind != "plan":
-                answer = payload or "I couldn't form a plan for that request."
+                if results:
+                    break  # enough evidence; write the answer below
+                answer = payload.strip() or (
+                    "The model returned neither a plan nor an explanation. Try naming the "
+                    "patient (by name or id like P003) and what you want checked."
+                )
                 self.gw.finish_run(token, run_id, answer)
                 return
+            plans_used += 1
+            messages.append({"role": "assistant", "content": json.dumps({"steps": payload})})
             try:
                 plan = self.gw.declare_plan(token, run_id, payload)
             except Denied as exc:
-                if exc.reason in ("DENY_REVOKED", "DENY_RUN_ENDED") or attempt == max_plans - 1:
+                if exc.reason in ("DENY_REVOKED", "DENY_RUN_ENDED") or self._revoked(token):
                     raise
-                messages.append({"role": "assistant", "content": json.dumps({"steps": payload})})
+                if plans_used >= max_plans:
+                    if results:
+                        break  # answer from what earlier plans already established
+                    raise
                 messages.append(
                     {
                         "role": "user",
                         "content": f"The gateway rejected that plan: {exc.reason} — {exc.detail}. "
-                        "Fix it and call declare_plan again.",
+                        "Fix it and call declare_plan again, or answer_directly if "
+                        "the request can't be served with these tools.",
                     }
                 )
                 continue
-            results = self._execute(token, run_id, plan, fault)
-            break
+            new = self._execute(token, run_id, plan, fault)
+            results.extend(new)
+            if plans_used >= max_plans or any(r["status"] != "ok" for r in new):
+                break
+            messages.append(
+                {
+                    "role": "user",
+                    "content": FOLLOW_UP.format(
+                        results=json.dumps(new, indent=1), left=max_plans - plans_used
+                    ),
+                }
+            )
         answer_messages = [
             {"role": "system", "content": ANSWER_PROMPT},
             {

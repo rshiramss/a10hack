@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,13 @@ def plan_turn(steps: list[dict[str, Any]]) -> SimpleNamespace:
     call = SimpleNamespace(
         id="c1",
         function=SimpleNamespace(name="declare_plan", arguments=json.dumps({"steps": steps})),
+    )
+    return SimpleNamespace(content=None, tool_calls=[call])
+
+
+def done_turn() -> SimpleNamespace:
+    call = SimpleNamespace(
+        id="c2", function=SimpleNamespace(name="answer_directly", arguments='{"answer": "DONE"}')
     )
     return SimpleNamespace(content=None, tool_calls=[call])
 
@@ -26,6 +34,6 @@ class FakeLLM:
         self.chat = SimpleNamespace(completions=self)
 
     def create(self, **kwargs: Any) -> SimpleNamespace:
-        self.requests.append(kwargs)
+        self.requests.append(copy.deepcopy(kwargs))
         message = self.turns.pop(0) if self.turns else text_turn("done")
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
