@@ -6,7 +6,8 @@
 system_id: WARD-01
 
 identity:
-  badge_ttl_seconds: 300          # every agent badge, master included
+  badge_ttl_seconds: 60           # every agent badge, master included
+  rotate_after_seconds: 45        # agents swap to a new badge + new key pair before expiry
   delegation_ttl_seconds: 60      # one consult's delegation token
   revoke_on_pop_failure: true    # a badge used without its key is treated as stolen
 

@@ -406,10 +406,15 @@ def scenarios() -> list[Scenario]:
             custom=lambda gw, m: _identity_attacks(gw, m),
             security=[
                 (
-                    "stolen badge: replay, foreign key, bare badge all refused",
+                    "stolen badge: pre-rotation pair, replay, foreign key, bare badge all refused",
                     lambda o: (
                         o.extra["steal"]
-                        == ["DENY_POP_REPLAY", "DENY_POP_MISMATCH", "DENY_POP_MISSING"]
+                        == [
+                            "DENY_BADGE_SUPERSEDED",
+                            "DENY_POP_REPLAY",
+                            "DENY_POP_MISMATCH",
+                            "DENY_POP_MISSING",
+                        ]
                     ),
                 ),
                 ("stolen badge revoked", lambda o: o.extra["victim_revoked"]),
@@ -429,10 +434,9 @@ def scenarios() -> list[Scenario]:
 
 
 def _identity_attacks(gw: Gateway, master: MasterAgent) -> dict[str, Any]:
-    master.ensure_identity()
-    captured = master._cred("capabilities")  # noqa: SLF001
-    gw.capabilities(captured)
-    steal = [r["result"] for r in gw.steal_badge_test(master._token, captured)]  # noqa: SLF001
+    from server.ward_app import steal_demo
+
+    steal = [r["result"] for r in steal_demo(gw, master)]
     victim = gw.conn.execute(
         "SELECT status FROM agents WHERE agent_id = ?", (master.agent_id,)
     ).fetchone()["status"]

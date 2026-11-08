@@ -925,3 +925,96 @@ def test_other_new_tools(master) -> None:  # noqa: ANN001
 
 def test_every_role_has_an_attested_build(gw: Gateway) -> None:
     assert set(gw.expected_measurements) == set(CFG.roles)
+
+
+# ---- badge encryption and rotation ---------------------------------------------------------
+
+
+def test_badges_are_encrypted_and_tamper_evident(gw: Gateway) -> None:
+    import base64
+
+    caller = Caller(gw, "labs")
+    token = caller.token
+    assert token.startswith("wb1.")
+    raw = base64.urlsafe_b64decode(token[4:] + "=" * (-len(token[4:]) % 4))
+    assert b"LabsAgent" not in raw and b"labs" not in raw  # nothing readable inside
+    flipped = token[:-2] + ("A" if token[-2] != "A" else "B") + token[-1]
+    with pytest.raises(Denied, match="DENY_BAD_BADGE"):
+        gw.check_badge(flipped)
+
+
+def rotate(gw: Gateway, caller: Caller) -> crypto.AgentKey:
+    new_key = crypto.AgentKey()
+    session = gw.rotate(
+        caller("rotate"), new_key.public_pem, new_key.proof(caller.token, "rotate-new-key")
+    )
+    caller.token, caller.key = session["token"], new_key
+    return new_key
+
+
+def test_rotation_issues_a_new_badge_on_a_new_key_and_kills_the_old(master) -> None:  # noqa: ANN001
+    gw, me = master
+    old_token, old_key = me.token, me.key
+    rotate(gw, me)
+    assert me.token != old_token
+    claims_old, claims_new = gw.keys.read_badge(old_token), gw.keys.read_badge(me.token)
+    assert claims_old["cnf"]["jkt"] != claims_new["cnf"]["jkt"]
+    assert claims_new["gen"] == 2
+    gw.capabilities(me("capabilities"))  # the new pair works
+    stolen = Credential(old_token, old_key.proof(old_token, "capabilities"))
+    with pytest.raises(Denied, match="DENY_BADGE_SUPERSEDED"):
+        gw.capabilities(stolen)  # badge + key stolen before rotation: dead
+    assert any(e["kind"] == "STALE_BADGE" for e in gw.snapshot()["audit"])
+
+
+def test_rotation_requires_both_keys(master) -> None:  # noqa: ANN001
+    gw, me = master
+    new_key, impostor = crypto.AgentKey(), crypto.AgentKey()
+    with pytest.raises(Denied, match="DENY_POP_MISMATCH"):  # can't prove the new key
+        gw.rotate(me("rotate"), new_key.public_pem, impostor.proof(me.token, "rotate-new-key"))
+    thief = Credential(me.token, impostor.proof(me.token, "rotate"))
+    with pytest.raises(Denied):  # can't prove the old key: a thief can't rotate a stolen badge
+        gw.rotate(thief, new_key.public_pem, new_key.proof(me.token, "rotate-new-key"))
+
+
+def test_master_rotates_on_schedule_and_keeps_working(gw: Gateway) -> None:
+    agent = MasterAgent(gw, FakeLLM([]), "fake")
+    agent.ensure_identity()
+    first = agent._token  # noqa: SLF001
+    assert agent.rotate_if_due() is False  # not due yet
+    assert agent.rotate_if_due(force=True) is True
+    assert agent._token != first  # noqa: SLF001
+    gw.capabilities(agent._cred("capabilities"))  # noqa: SLF001
+
+
+def test_specialists_rotate_before_an_offer_when_due(master) -> None:  # noqa: ANN001
+    gw, me = master
+    gw.config = __import__("dataclasses").replace(gw.config, rotate_after_seconds=0)
+    run_id = gw.start_run(me("start_run"), "t")
+    plan = gw.declare_plan(
+        me("declare_plan"),
+        run_id,
+        [
+            step("LabsAgent", "get_renal_function", patient_id="P001"),
+            step("LabsAgent", "get_latest_labs", patient_id="P001"),
+        ],
+    )
+    gw.consult(me("consult"), plan["leases"][0]["lease_id"])
+    out = gw.consult(me("consult"), plan["leases"][1]["lease_id"])  # same instance, rotated
+    assert out["agent"] == "LabsAgent1"
+    assert any(
+        e["kind"] == "BADGE_ROTATED" and e["actor"] == "LabsAgent1" for e in gw.snapshot()["audit"]
+    )
+
+
+def test_steal_demo_covers_the_pre_rotation_pair(gw: Gateway) -> None:
+    from server.ward_app import steal_demo
+
+    agent = MasterAgent(gw, FakeLLM([]), "fake")
+    results = [r["result"] for r in steal_demo(gw, agent)]
+    assert results == [
+        "DENY_BADGE_SUPERSEDED",
+        "DENY_POP_REPLAY",
+        "DENY_POP_MISMATCH",
+        "DENY_POP_MISSING",
+    ]

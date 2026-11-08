@@ -342,14 +342,36 @@ class MasterAgent:
         self._secret: str | None = None
         self._token: str | None = None
         self._key: crypto.AgentKey | None = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
     # ---- identity ---------------------------------------------------------------------
 
     def _cred(self, op: str) -> Credential:
-        """Badge + a fresh proof, signed with this agent's own key, for one operation."""
-        assert self._token is not None and self._key is not None
-        return Credential(self._token, self._key.proof(self._token, op))
+        """Badge + a fresh proof, signed with this agent's own key, for one operation.
+        Rotates first if the badge is due."""
+        self.rotate_if_due()
+        with self.lock:
+            assert self._token is not None and self._key is not None
+            return Credential(self._token, self._key.proof(self._token, op))
+
+    def rotate_if_due(self, force: bool = False) -> bool:
+        """Swap to a new badge bound to a brand-new key pair. True if it rotated."""
+        with self.lock:
+            if not self._token or not self._key:
+                return False
+            if not force and not self.gw.rotate_due(self._token):
+                return False
+            new_key = crypto.AgentKey()
+            try:
+                session = self.gw.rotate(
+                    Credential(self._token, self._key.proof(self._token, "rotate")),
+                    new_key.public_pem,
+                    new_key.proof(self._token, "rotate-new-key"),
+                )
+            except Denied:
+                return False  # revoked or expired: the next call says so
+            self._key, self._token = new_key, session["token"]
+            return True
 
     def _login(self) -> None:
         cfg = self.gw.config
@@ -371,7 +393,9 @@ class MasterAgent:
                 return self._token
             except Denied as exc:
                 if exc.reason == "DENY_BADGE_EXPIRED":
-                    self._login()
+                    with self.lock:
+                        self._key = crypto.AgentKey()  # fresh key on every new login
+                        self._login()
                     return self._token
         self.agent_id, self._secret = self.gw.provision(self.gw.config.master_role)
         self._key = crypto.AgentKey()
@@ -547,7 +571,7 @@ class MasterAgent:
             )  # raises Denied once the watchdog revokes us
             self._sleep(0.5)
 
-    def _revoked(self, token: str) -> bool:
+    def _revoked(self, token: str | None = None) -> bool:
         try:
             self.gw.check_badge(self._token)
             return False

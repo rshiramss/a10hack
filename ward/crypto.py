@@ -1,7 +1,9 @@
 """Identity layers. Each consult a specialist accepts has passed all of them:
 
 1. Workload credential   client secret, stored only as HMAC-SHA256          (who you are)
-2. Badge                 HS256 JWT, short TTL, revocable by jti              (gateway session)
+2. Badge                 HS256-signed claims, then sealed with AES-256-GCM  (gateway session;
+                         (sign-then-encrypt, like a nested JWT). 60 s TTL,   a leaked badge
+                         rotated with a new key pair, revocable by jti       reveals nothing)
 3. Delegation token      Ed25519 JWT signed by the gateway, audience = one   (only the master,
                          instance, bound to the lease and an args hash        via the gateway)
 4. Sealed consult        AES-256-GCM, key derived from the target's current  (only that
@@ -14,6 +16,7 @@ fresh at startup and its private half never leaves the gateway.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -28,6 +31,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 ISSUER = "ward-gateway"
+BADGE_PREFIX = "wb1."
+BADGE_AAD = b"ward-badge-v1"
 
 
 def derive(master: bytes, purpose: str) -> bytes:
@@ -56,6 +61,7 @@ class KeyRing:
     def __init__(self, master: bytes | None = None) -> None:
         self.master = master or os.urandom(32)
         self.badge_key = derive(self.master, "badge")
+        self.badge_enc_key = derive(self.master, "badge-encryption")
         self.credential_key = derive(self.master, "credential")
         self._signing = Ed25519PrivateKey.generate()
         self.delegation_public_pem = (
@@ -72,12 +78,26 @@ class KeyRing:
 
     # 2. badges
     def sign_badge(self, claims: dict[str, Any]) -> str:
-        return jwt.encode(claims, self.badge_key, algorithm="HS256")
+        """Sign the claims (HS256), then seal the signed token with AES-256-GCM. The result
+        is opaque: without the gateway's key nobody can read the agent, role, or key
+        thumbprint inside, and any change to it fails the GCM tag."""
+        signed = jwt.encode(claims, self.badge_key, algorithm="HS256").encode()
+        nonce = os.urandom(12)
+        box = AESGCM(self.badge_enc_key).encrypt(nonce, signed, BADGE_AAD)
+        return BADGE_PREFIX + base64.urlsafe_b64encode(nonce + box).decode().rstrip("=")
 
     def read_badge(self, token: str) -> dict[str, Any]:
-        """Signature check only. Expiry and revocation are checked against the database."""
+        """Decrypt, then verify the signature. Expiry, revocation and supersession are
+        checked against the database."""
+        if not isinstance(token, str) or not token.startswith(BADGE_PREFIX):
+            raise jwt.InvalidTokenError("not a ward badge")
+        try:
+            raw = base64.urlsafe_b64decode(token[len(BADGE_PREFIX) :] + "=" * (-len(token) % 4))
+            signed = AESGCM(self.badge_enc_key).decrypt(raw[:12], raw[12:], BADGE_AAD)
+        except Exception as exc:  # noqa: BLE001 - any failure to open is an invalid badge
+            raise jwt.InvalidTokenError("badge didn't decrypt") from exc
         return jwt.decode(
-            token,
+            signed.decode(),
             self.badge_key,
             algorithms=["HS256"],
             options={"verify_exp": False, "verify_aud": False},

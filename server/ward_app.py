@@ -93,6 +93,34 @@ class Console:
         self.thread.start()
 
 
+def steal_demo(gateway: Gateway, master: MasterAgent) -> list[dict[str, str]]:
+    """Simulated exfiltration of the master's credentials, in two stages.
+
+    1. The attacker steals the badge AND the private key, then the master rotates on
+       schedule. The stolen pair is now dead.
+    2. The attacker steals the new badge plus one signed request (but not the new key) and
+       tries replay, its own key, and the bare badge. All refused; the badge is revoked.
+    """
+    from ward.gateway import Credential
+
+    master.ensure_identity()
+    old_token, old_key = master._token, master._key  # noqa: SLF001 - full compromise
+    master.rotate_if_due(force=True)
+    label = "Attacker uses badge + private key stolen before the last rotation"
+    try:
+        gateway.verify(
+            Credential(old_token, old_key.proof(old_token, "capabilities")),
+            "capabilities",
+            revoke_on_fail=False,
+        )
+        results = [{"attempt": label, "result": "ACCEPTED?!"}]
+    except Denied as exc:
+        results = [{"attempt": label, "result": exc.reason}]
+    captured = master._cred("capabilities")  # noqa: SLF001
+    gateway.capabilities(captured)  # the real master's request, sent once
+    return results + gateway.steal_badge_test(master._token, captured)  # noqa: SLF001
+
+
 def create_app(
     config: WardConfig | None = None,
     llm: Any = None,
@@ -122,6 +150,8 @@ def create_app(
             while True:
                 with contextlib.suppress(Exception):  # the watchdog must never die
                     app.state.console.gateway.watchdog_tick()
+                with contextlib.suppress(Exception):  # idle masters rotate on schedule too
+                    app.state.console.master.rotate_if_due()
                 time.sleep(0.25)
 
         threading.Thread(target=tick, daemon=True).start()
@@ -261,11 +291,7 @@ def create_app(
         if (bad := guarded(request)) is not None:
             return bad
         c = app.state.console
-        c.master.ensure_identity()
-        captured = c.master._cred("capabilities")  # noqa: SLF001 - simulated exfiltration
-        c.gateway.capabilities(captured)  # the real master's request, sent once
-        stolen = c.master._token  # noqa: SLF001
-        return JSONResponse({"ok": True, "results": c.gateway.steal_badge_test(stolen, captured)})
+        return JSONResponse({"ok": True, "results": steal_demo(c.gateway, c.master)})
 
     @app.post("/api/attack/tampered")
     def tampered(request: Request) -> JSONResponse:

@@ -76,6 +76,7 @@ class WardConfig:
     delegation_ttl_seconds: int
     run: dict[str, Any]
     revoke_on_pop_failure: bool
+    rotate_after_seconds: int
     roles: dict[str, RoleSpec]
     tools: dict[str, ToolSpec]
     vocab: dict[str, tuple[str, ...]]
@@ -193,6 +194,7 @@ def load_config(path: Path | str = DEFAULT_PATH) -> WardConfig:
         badge_ttl_seconds=int(raw["identity"]["badge_ttl_seconds"]),
         delegation_ttl_seconds=int(raw["identity"]["delegation_ttl_seconds"]),
         revoke_on_pop_failure=bool(raw["identity"].get("revoke_on_pop_failure", True)),
+        rotate_after_seconds=int(raw["identity"].get("rotate_after_seconds", 45)),
         run=run,
         roles=roles,
         tools=tools,

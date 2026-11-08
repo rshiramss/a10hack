@@ -45,7 +45,7 @@ CREATE TABLE credentials (agent_id TEXT PRIMARY KEY, secret_hmac TEXT NOT NULL);
 CREATE TABLE badges (
     jti TEXT PRIMARY KEY, agent_id TEXT NOT NULL, issued_ms INTEGER NOT NULL,
     expires_ms INTEGER NOT NULL, revoked_ms INTEGER, denied INTEGER NOT NULL DEFAULT 0,
-    public_pem TEXT NOT NULL, jkt TEXT NOT NULL
+    public_pem TEXT NOT NULL, jkt TEXT NOT NULL, superseded_by TEXT, generation INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE runs (
     run_id TEXT PRIMARY KEY, master_id TEXT NOT NULL, prompt TEXT NOT NULL,
@@ -284,48 +284,110 @@ class Gateway:
             self.conn.execute(
                 "UPDATE agents SET measurement = ? WHERE agent_id = ?", (measurement, agent_id)
             )
-            jti = uuid.uuid4().hex
-            issued = now_ms()
-            expires = issued + self.config.badge_ttl_seconds * 1000
-            token = self.keys.sign_badge(
-                {
-                    "iss": crypto.ISSUER,
-                    "sub": agent_id,
-                    "role": row["role"],
-                    "system": self.config.system_id,
-                    "jti": jti,
-                    "iat": issued // 1000,
-                    "exp": expires // 1000,
-                    "cnf": {"jkt": jkt},
-                    "att": measurement[:16],
-                }
-            )
-            self.conn.execute(
-                "INSERT INTO badges (jti, agent_id, issued_ms, expires_ms, public_pem, jkt)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (jti, agent_id, issued, expires, public_pem, jkt),
-            )
+            session = self._issue_badge(agent_id, role, public_pem, measurement, generation=1)
             self._audit(
                 "AUTHENTICATED",
-                f"{agent_id} authenticated: code attested, badge {jti[:8]} bound to key "
-                f"{jkt[:8]}, valid {self.config.badge_ttl_seconds}s",
+                f"{agent_id} authenticated: code attested, badge {session['jti'][:8]} bound to "
+                f"key {jkt[:8]}, valid {self.config.badge_ttl_seconds}s",
                 run_id=row["run_id"],
                 target=agent_id,
                 detail={
-                    "badge": f"HS256 JWT, jti {jti[:8]}…",
-                    "role": row["role"],
+                    "badge": f"HS256-signed, AES-256-GCM-sealed, jti {session['jti'][:8]}…",
+                    "role": role,
                     "cnf.jkt": jkt,
                     "measurement": measurement,
                 },
             )
-            seal_key, proof_key = self.keys.instance_keys(agent_id, jti)
-            return {
-                "token": token,
+            return session
+
+    def _issue_badge(
+        self, agent_id: str, role: str, public_pem: str, measurement: str, generation: int
+    ) -> dict[str, Any]:
+        """Mint a badge bound to `public_pem`. Caller holds the lock."""
+        jkt = crypto.thumbprint(public_pem)
+        jti = uuid.uuid4().hex
+        issued = now_ms()
+        expires = issued + self.config.badge_ttl_seconds * 1000
+        token = self.keys.sign_badge(
+            {
+                "iss": crypto.ISSUER,
+                "sub": agent_id,
+                "role": role,
+                "system": self.config.system_id,
                 "jti": jti,
-                "expires_ms": expires,
-                "seal_key": seal_key,
-                "proof_key": proof_key,
+                "iat": issued // 1000,
+                "exp": expires // 1000,
+                "cnf": {"jkt": jkt},
+                "att": measurement[:16],
+                "gen": generation,
             }
+        )
+        self.conn.execute(
+            "INSERT INTO badges (jti, agent_id, issued_ms, expires_ms, public_pem, jkt, generation)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (jti, agent_id, issued, expires, public_pem, jkt, generation),
+        )
+        seal_key, proof_key = self.keys.instance_keys(agent_id, jti)
+        return {
+            "token": token,
+            "jti": jti,
+            "issued_ms": issued,
+            "expires_ms": expires,
+            "seal_key": seal_key,
+            "proof_key": proof_key,
+        }
+
+    def rotate(self, cred: Credential, new_public_pem: str, new_key_proof: str) -> dict[str, Any]:
+        """Swap a live badge for a new one bound to a NEW key pair.
+
+        The caller proves it holds the current key (the signed `rotate` call) and the new
+        key (a proof signed with it over the current badge). The old badge stops working
+        immediately, so a badge and key stolen before a rotation are both dead after it.
+        """
+        badge = self.verify(cred, "rotate")
+        try:
+            crypto.verify_proof(
+                new_public_pem, new_key_proof, cred.token, "rotate-new-key", time.time()
+            )
+        except ValueError as exc:
+            raise Denied("DENY_POP_MISMATCH", "couldn't prove possession of the new key") from exc
+        with self.lock:
+            old = self.conn.execute("SELECT * FROM badges WHERE jti = ?", (badge.jti,)).fetchone()
+            agent = self.conn.execute(
+                "SELECT measurement, run_id FROM agents WHERE agent_id = ?", (badge.agent_id,)
+            ).fetchone()
+            session = self._issue_badge(
+                badge.agent_id,
+                badge.role,
+                new_public_pem,
+                agent["measurement"] or "",
+                generation=old["generation"] + 1,
+            )
+            self.conn.execute(
+                "UPDATE badges SET superseded_by = ? WHERE jti = ?", (session["jti"], badge.jti)
+            )
+            self._audit(
+                "BADGE_ROTATED",
+                f"{badge.agent_id} rotated: badge {badge.jti[:8]} → {session['jti'][:8]}, "
+                f"key {old['jkt'][:8]} → {crypto.thumbprint(new_public_pem)[:8]} "
+                f"(generation {old['generation'] + 1}); the old badge is dead",
+                run_id=agent["run_id"],
+                actor=badge.agent_id,
+            )
+            return session
+
+    def rotate_due(self, token: str) -> bool:
+        """True if this badge is old enough that its holder should rotate it now."""
+        try:
+            claims = self.keys.read_badge(token)
+        except jwt.PyJWTError:
+            return False
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT issued_ms FROM badges WHERE jti = ?", (claims["jti"],)
+            ).fetchone()
+        rotate_after = int(self.config.rotate_after_seconds) * 1000
+        return row is not None and now_ms() - row["issued_ms"] >= rotate_after
 
     def check_badge(self, token: str | None) -> Badge:
         if not token:
@@ -343,6 +405,8 @@ class Gateway:
             ).fetchone()
         if badge is None or agent is None or badge["agent_id"] != claims["sub"]:
             raise Denied("DENY_BAD_BADGE", "badge was never issued")
+        if badge["superseded_by"] is not None:
+            raise Denied("DENY_BADGE_SUPERSEDED", "badge was rotated out")
         if badge["revoked_ms"] is not None or agent["status"] != "active":
             raise Denied("DENY_REVOKED", "badge revoked")
         if now_ms() >= badge["expires_ms"]:
@@ -352,7 +416,20 @@ class Gateway:
     def verify(self, cred: Credential, op: str, revoke_on_fail: bool | None = None) -> Badge:
         """Badge checks + proof of possession: the caller holds the key the badge is bound
         to, the proof is for this operation, fresh, and never seen before."""
-        badge = self.check_badge(cred.token)
+        try:
+            badge = self.check_badge(cred.token)
+        except Denied as exc:
+            if exc.reason == "DENY_BADGE_SUPERSEDED":
+                claims = self.keys.read_badge(cred.token)
+                self._audit(
+                    "STALE_BADGE",
+                    f"A rotated-out badge of {claims['sub']} was presented: refused",
+                    decision="DENY",
+                    reason=exc.reason,
+                    actor=claims["sub"],
+                    detail={"op": op},
+                )
+            raise
         revoke = self.config.revoke_on_pop_failure if revoke_on_fail is None else revoke_on_fail
         with self.lock:
             row = self.conn.execute(
@@ -971,7 +1048,17 @@ class Gateway:
             (run_id, role),
         ).fetchone()
         if row and row["agent_id"] in self._instances:
-            return self._instances[row["agent_id"]]
+            instance = self._instances[row["agent_id"]]
+            if instance.session and self.rotate_due(instance.session.badge):
+                try:
+                    instance.rotate(self)
+                except Denied as exc:
+                    if exc.reason != "DENY_BADGE_EXPIRED":
+                        raise
+                    # Idle past expiry: a full re-login (secret + attestation + new key).
+                    instance.key = crypto.AgentKey()
+                    instance.login(self)
+            return instance
         agent_id, secret = self.provision(role, run_id)
         instance = SpecialistInstance(
             agent_id,
@@ -1202,7 +1289,7 @@ class Gateway:
             agents = []
             for a in self.conn.execute("SELECT * FROM agents ORDER BY created_ms DESC LIMIT 40"):
                 badge = self.conn.execute(
-                    "SELECT jti, expires_ms, jkt FROM badges WHERE agent_id = ? ORDER BY issued_ms DESC LIMIT 1",
+                    "SELECT jti, issued_ms, expires_ms, jkt, generation FROM badges WHERE agent_id = ? ORDER BY issued_ms DESC LIMIT 1",
                     (a["agent_id"],),
                 ).fetchone()
                 role = self.config.roles[a["role"]]
@@ -1218,6 +1305,14 @@ class Gateway:
                         "end_reason": a["end_reason"],
                         "badge": badge["jti"][:8] if badge else None,
                         "key": badge["jkt"][:8] if badge else None,
+                        "generation": badge["generation"] if badge else 0,
+                        "rotate_in": max(
+                            0,
+                            (badge["issued_ms"] + self.config.rotate_after_seconds * 1000 - t)
+                            // 1000,
+                        )
+                        if badge
+                        else 0,
                         "attested": a["measurement"] is not None
                         and a["measurement"] == self.expected_measurements.get(a["role"]),
                         "attestation_failed": a["measurement"] is None

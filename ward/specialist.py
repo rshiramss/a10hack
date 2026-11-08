@@ -86,6 +86,23 @@ class SpecialistInstance:
     def adopt_session(self, badge: str, badge_jti: str, seal_key: bytes, proof_key: bytes) -> None:
         self.session = Session(badge, badge_jti, seal_key, proof_key)
 
+    def rotate(self, gateway: Any) -> None:
+        """New key pair; prove old + new key; adopt the new badge. The old one dies."""
+        assert self.session is not None
+        from ward.gateway import Credential
+
+        new_key = crypto.AgentKey()
+        token = self.session.badge
+        session = gateway.rotate(
+            Credential(token, self.key.proof(token, "rotate")),
+            new_key.public_pem,
+            new_key.proof(token, "rotate-new-key"),
+        )
+        self.key = new_key
+        self.adopt_session(
+            session["token"], session["jti"], session["seal_key"], session["proof_key"]
+        )
+
     def handle_offer(self, offer: dict[str, Any], challenge: str) -> dict[str, Any]:
         """Verify an offer and answer the handshake. Raises OfferRefused."""
         if self.session is None:

@@ -24,9 +24,18 @@ Every agent, master included, proves its identity in three ways before it can ac
   self-reported in-process; in production it would come from a TEE or SPIFFE attestor.)
 - **Key-bound badge.** The agent generates its own Ed25519 key and proves it holds it at
   login. The badge is bound to that key (`cnf.jkt`), so a stolen badge alone is useless.
-- **Signed calls.** Every call carries a fresh proof signed with that key: which operation,
-  a hash of the badge, a timestamp, and a one-time id. Replays and foreign keys are refused,
-  and a badge used without its key is revoked as stolen.
+- **Encrypted badge.** The badge's claims are HS256-signed and then sealed with AES-256-GCM
+  (sign-then-encrypt, like a nested JWT). A leaked badge reveals nothing (not the agent,
+  role, or key thumbprint) and any change breaks it. Encryption here gives
+  confidentiality; the signature and the key binding are what authenticate.
+- **Rotation with fresh keys.** Badges live 60 s. At 45 s the agent generates a brand-new
+  key pair, proves it holds both the old and the new key, and gets a new badge bound to
+  the new key; the old badge is dead at once. A badge *and* private key stolen before a
+  rotation are useless after it. Per-instance seal/proof keys are derived from the
+  current badge, so they rotate too.
+- **Signed calls.** Every call carries a fresh proof signed with the current key: which
+  operation, a hash of the badge, a timestamp, and a one-time id. Replays and foreign keys
+  are refused, and a badge used without its key is revoked as stolen.
 
 Every consult is a two-way handshake through the gateway. Agents never exchange
 natural language, only schema-checked typed values:
@@ -45,8 +54,9 @@ natural language, only schema-checked typed values:
    typed result back. The gateway validates it against the output schema (a poisoned record
    is quarantined, never forwarded) and pipes typed values to later steps.
 
-Demo controls: **Steal master's badge** (an attacker replays a captured request, signs
-with its own key, then tries the bare badge: all refused, badge revoked), **Tampered agent**
+Demo controls: **Steal master's badge** (an attacker who stole the badge and private key
+before the last rotation is refused; then, with the current badge, a replayed request, its
+own key, and the bare badge are all refused and the badge is revoked), **Tampered agent**
 (a MedHistoryAgent modified to hide allergies is refused a badge), **Revoke** any agent at any moment (a revoked specialist is replaced by a
 fresh instance once; a revoked master aborts its run), **stuck-agent mode** (the watchdog
 revokes a master that makes no progress for N seconds), **Rogue agent test** (a specialist

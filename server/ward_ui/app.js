@@ -7,7 +7,7 @@ const KEY_KINDS = new Set([
   "SPAWNED", "AUTHENTICATED", "AUTH_FAILED", "RUN_STARTED", "RUN_ENDED", "PLAN_APPROVED",
   "DENIED", "REVOKED", "HANDSHAKE_REFUSED", "OUTPUT_REJECTED", "RESULT_DISCARDED",
   "FORGERY_REFUSED", "INJECTION_FLAGGED", "DELIVERED", "OPERATOR_LOGIN", "OPERATOR_LOGIN_FAILED",
-  "POP_REJECTED", "ATTESTATION_FAILED",
+  "POP_REJECTED", "ATTESTATION_FAILED", "BADGE_ROTATED", "STALE_BADGE",
 ]);
 const ICON = { ALLOW: "✓", DENY: "✗", EVENT: "•" };
 
@@ -109,7 +109,8 @@ function agentCard(agent, busy) {
     ]),
     el("div", { class: "row" }, [
       el("span", { class: "meta", text: agent.badge
-        ? `badge ${agent.badge}${agent.status === "active" ? ` · ${agent.expires_in}s left` : ""}` : "no badge issued" }),
+        ? `badge ${agent.badge} · gen ${agent.generation}${agent.status === "active" ? ` · rotates in ${agent.rotate_in}s` : ""}`
+        : "no badge issued" }),
       agent.status === "active" ? revoke : null,
     ]),
     el("div", { class: "idline" }, [
@@ -283,7 +284,7 @@ function renderAnswer(text) {
 function renderChat(snap) {
   const master = snap.agents.find((a) => a.master && a.status === "active");
   $("master-id").replaceChildren(master
-    ? el("span", {}, [el("b", { text: master.agent_id }), ` · badge ${master.badge} · ${master.expires_in}s left · model ${snap.llm.model}`])
+    ? el("span", {}, [el("b", { text: master.agent_id }), ` · badge ${master.badge} (gen ${master.generation}, rotates in ${master.rotate_in}s) · model ${snap.llm.model}`])
     : el("span", { text: "No active master. The next request spins up a new one with fresh credentials." }));
   const warn = $("llm-warning");
   warn.hidden = !snap.llm.problem;
